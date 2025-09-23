@@ -27,7 +27,12 @@ from sqlalchemy.pool import StaticPool
 load_dotenv()
 
 # Initialize LLM
-model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4o")
+import os
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY environment variable is required")
+
+model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4o", api_key=api_key)
 
 # Database setup
 def get_engine_for_chinook_db():
