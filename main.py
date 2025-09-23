@@ -13,7 +13,7 @@ from typing import Dict, Any, List
 from dotenv import load_dotenv
 
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities.sql_database import SQLDatabase
 from langgraph.graph import StateGraph, END, START
@@ -226,36 +226,42 @@ def _route(state):
         return "general"
     
     last_message = messages[-1]
-    if isinstance(last_message, AIMessage):
-        if not _is_tool_call(last_message):
-            return END
-        else:
-            if last_message.name == "general":
-                tool_calls = last_message.additional_kwargs['tool_calls']
-                if len(tool_calls) > 1:
-                    raise ValueError
-                tool_call = tool_calls[0]
-                return json.loads(tool_call['function']['arguments'])['choice']
-            else:
-                return "tools"
     
-    # Fallback routing based on last AI message
-    last_m = _get_last_ai_message(messages)
-    if last_m is None:
+    # If last message is a human message, route to general
+    if isinstance(last_message, HumanMessage):
         return "general"
-    if last_m.name == "music":
-        return "music"
-    elif last_m.name == "customer":
-        return "customer"
-    else:
-        return "general"
+    
+    # If last message is an AI message with tool calls
+    if isinstance(last_message, AIMessage) and _is_tool_call(last_message):
+        if last_message.name == "general":
+            # General agent made a routing decision
+            tool_calls = last_message.additional_kwargs['tool_calls']
+            if len(tool_calls) > 1:
+                raise ValueError("Multiple tool calls not supported")
+            tool_call = tool_calls[0]
+            return json.loads(tool_call['function']['arguments'])['choice']
+        else:
+            # Music or customer agent made tool calls
+            return "tools"
+    
+    # If last message is a tool response, end the conversation
+    if isinstance(last_message, ToolMessage):
+        return END
+    
+    # If last message is an AI message without tool calls, end conversation
+    if isinstance(last_message, AIMessage) and not _is_tool_call(last_message):
+        return END
+    
+    # Default fallback
+    return "general"
 
 def _filter_out_routes(messages):
+    """Filter out routing messages but keep tool calls and responses."""
     ms = []
     for m in messages:
-        if _is_tool_call(m):
-            if m.name == "general":
-                continue
+        if _is_tool_call(m) and m.name == "general":
+            # Skip general agent routing messages
+            continue
         ms.append(m)
     return ms
 
@@ -264,19 +270,49 @@ tools = [get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_custom
 tools_node = ToolNode(tools)
 
 def general_node(state):
-    messages = _filter_out_routes(state["messages"])
-    result = general_chain.invoke(messages)
+    messages = state["messages"]
+    # Only filter out previous general routing messages, keep everything else
+    filtered_messages = _filter_out_routes(messages)
+    result = general_chain.invoke(filtered_messages)
     return {"messages": [add_name(result, name="general")]}
 
 def music_node(state):
-    messages = _filter_out_routes(state["messages"])
-    result = song_recc_chain.invoke(messages)
-    return {"messages": [add_name(result, name="music")]}
+    messages = state["messages"]
+    
+    # Check if we already have a music agent response
+    last_ai = _get_last_ai_message(messages)
+    if last_ai and last_ai.name == "music" and not _is_tool_call(last_ai):
+        # Music agent already responded, don't process again
+        return {"messages": []}
+    
+    # Get the last user message for music queries
+    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    if user_messages:
+        last_user_message = user_messages[-1]
+        # Create a proper conversation context for the music agent
+        conversation_context = [SystemMessage(content=song_system_message), last_user_message]
+        result = song_recc_chain.invoke(conversation_context)
+        return {"messages": [add_name(result, name="music")]}
+    return {"messages": []}
 
 def customer_node(state):
-    messages = _filter_out_routes(state["messages"])
-    result = customer_chain.invoke(messages)
-    return {"messages": [add_name(result, name="customer")]}
+    messages = state["messages"]
+    
+    # Check if we already have a customer agent response
+    last_ai = _get_last_ai_message(messages)
+    if last_ai and last_ai.name == "customer" and not _is_tool_call(last_ai):
+        # Customer agent already responded, don't process again
+        return {"messages": []}
+    
+    # Get the last user message for customer queries
+    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    if user_messages:
+        last_user_message = user_messages[-1]
+        # Create a proper conversation context for the customer agent
+        conversation_context = [SystemMessage(content=customer_prompt), last_user_message]
+        result = customer_chain.invoke(conversation_context)
+        return {"messages": [add_name(result, name="customer")]}
+    return {"messages": []}
 
 # Graph definition
 def create_graph():
@@ -319,8 +355,13 @@ if __name__ == "__main__":
     # Test the graph locally
     from langchain_core.messages import HumanMessage
     
-    # Test message
-    test_input = {"messages": [HumanMessage(content="hi! can you help me find songs by U2?")]}
-    config = {"configurable": {"thread_id": "test-thread"}}
-    result = graph.invoke(test_input, config=config)
-    print("Test result:", result)
+    # Test with customer query
+    test_input = {"messages": [HumanMessage(content="What's my account information?")]}
+    config = {"configurable": {"thread_id": "test-thread"}, "recursion_limit": 20}
+    
+    try:
+        result = graph.invoke(test_input, config=config)
+        print("Customer test result:", result)
+    except Exception as e:
+        print("Error:", e)
+        print("This suggests there's an issue with the customer agent flow")
