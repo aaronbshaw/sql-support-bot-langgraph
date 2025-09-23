@@ -254,10 +254,9 @@ def _route(state):
             return last_ai.name
         return "general"
     
-    # If last message is an AI message without tool calls, continue conversation
+    # If last message is an AI message without tool calls, end conversation
     if isinstance(last_message, AIMessage) and not _is_tool_call(last_message):
-        # Don't end conversation - allow for follow-up messages
-        return "general"
+        return END
     
     # Default fallback
     return "general"
@@ -279,20 +278,31 @@ tools_node = ToolNode(tools)
 def general_node(state):
     messages = state["messages"]
     
-    # Check if this is a follow-up message after an agent response
+    # Check if this looks like a follow-up to a previous conversation
     if len(messages) >= 2:
         last_message = messages[-1]
         second_last_message = messages[-2]
         
-        # If last message is human and second last is an AI response, this is a follow-up
-        if isinstance(last_message, HumanMessage) and isinstance(second_last_message, AIMessage):
-            # Create conversation context with recent history
-            recent_messages = messages[-3:] if len(messages) >= 3 else messages[-2:]
-            conversation_context = [SystemMessage(content=system_message)] + recent_messages
+        # If last message is human and second last is an AI response asking for info
+        if (isinstance(last_message, HumanMessage) and 
+            isinstance(second_last_message, AIMessage) and 
+            second_last_message.name in ["customer", "music"]):
+            
+            # This is likely a follow-up, include context
+            conversation_context = [SystemMessage(content=system_message), second_last_message, last_message]
             result = general_chain.invoke(conversation_context)
             return {"messages": [add_name(result, name="general")]}
     
-    # Only filter out previous general routing messages, keep everything else
+    # Get the last human message for routing
+    human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    if human_messages:
+        last_human_message = human_messages[-1]
+        # Create a fresh context with just the system message and the latest human message
+        conversation_context = [SystemMessage(content=system_message), last_human_message]
+        result = general_chain.invoke(conversation_context)
+        return {"messages": [add_name(result, name="general")]}
+    
+    # Fallback - filter out previous general routing messages
     filtered_messages = _filter_out_routes(messages)
     result = general_chain.invoke(filtered_messages)
     return {"messages": [add_name(result, name="general")]}
@@ -320,16 +330,6 @@ def music_node(state):
     user_messages = [m for m in messages if isinstance(m, HumanMessage)]
     if user_messages:
         last_user_message = user_messages[-1]
-        
-        # Check if this is a follow-up message in a music conversation
-        if len(messages) >= 2:
-            second_last_message = messages[-2]
-            if isinstance(second_last_message, AIMessage) and second_last_message.name == "music":
-                # This is a follow-up in a music conversation, include context
-                conversation_context = [SystemMessage(content=song_system_message), second_last_message, last_user_message]
-                result = song_recc_chain.invoke(conversation_context)
-                return {"messages": [add_name(result, name="music")]}
-        
         # Create a proper conversation context for the music agent
         conversation_context = [SystemMessage(content=song_system_message), last_user_message]
         result = song_recc_chain.invoke(conversation_context)
@@ -360,11 +360,13 @@ def customer_node(state):
     if user_messages:
         last_user_message = user_messages[-1]
         
-        # Check if this is a follow-up message in a customer conversation
+        # Check if this is a follow-up message (like providing an ID after being asked)
         if len(messages) >= 2:
             second_last_message = messages[-2]
-            if isinstance(second_last_message, AIMessage) and second_last_message.name == "customer":
-                # This is a follow-up in a customer conversation, include context
+            if (isinstance(second_last_message, AIMessage) and 
+                second_last_message.name == "customer" and
+                ("ID" in second_last_message.content or "email" in second_last_message.content.lower())):
+                # This is a follow-up with customer info, include the previous context
                 conversation_context = [SystemMessage(content=customer_prompt), second_last_message, last_user_message]
                 result = customer_chain.invoke(conversation_context)
                 return {"messages": [add_name(result, name="customer")]}
@@ -413,67 +415,92 @@ def get_graph():
     return graph
 
 if __name__ == "__main__":
-    # Test continuous conversation
-    from langchain_core.messages import HumanMessage
+    # Debug mode - set to True to run tests, False to interact with the bot
+    DEBUG_MODE = False
     
-    print("💬 Testing Continuous Conversation")
-    print("=" * 50)
-    
-    # Test: Music conversation with follow-up
-    print("\n🧪 Testing: Music Conversation with Follow-up")
-    test_input = {"messages": [
-        HumanMessage(content="Tell me about U2 songs"),
-        HumanMessage(content="What about Beatles songs?")
-    ]}
-    config = {"configurable": {"thread_id": "test-continuous-music"}, "recursion_limit": 20}
-    
-    try:
-        result = graph.invoke(test_input, config=config)
-        print("✅ Continuous music conversation: PASSED")
-        print(f"   📊 Total messages: {len(result['messages'])}")
+    if DEBUG_MODE:
+        # Test customer follow-up scenario
+        from langchain_core.messages import HumanMessage
         
-        # Show the conversation flow
-        for i, msg in enumerate(result['messages']):
-            if hasattr(msg, 'name') and msg.name:
-                print(f"   {i+1}. {msg.name}: {type(msg).__name__}")
-            else:
-                print(f"   {i+1}. {type(msg).__name__}")
+        print("🧪 Testing Customer Follow-up Context")
+        print("=" * 50)
         
-        # Check if we got a final response
-        last_msg = result['messages'][-1]
-        if hasattr(last_msg, 'content') and last_msg.content:
-            print(f"   📝 Final response: {last_msg.content[:100]}...")
+        # Test: Account question followed by providing ID
+        print("\n🧪 Testing: Account Question → Providing ID")
+        test_input = {"messages": [
+            HumanMessage(content="What's my account information?"),
+            HumanMessage(content="My customer ID is 1")
+        ]}
+        config = {"configurable": {"thread_id": "test-customer-followup"}, "recursion_limit": 25}
+        
+        try:
+            result = graph.invoke(test_input, config=config)
+            print("✅ Customer follow-up: PASSED")
+            print(f"   📊 Total messages: {len(result['messages'])}")
             
-    except Exception as e:
-        print(f"❌ Continuous music conversation: FAILED - {e}")
-    
-    # Test: Customer conversation with follow-up
-    print("\n🧪 Testing: Customer Conversation with Follow-up")
-    test_input = {"messages": [
-        HumanMessage(content="What's my account information?"),
-        HumanMessage(content="My email is john.doe@email.com")
-    ]}
-    config = {"configurable": {"thread_id": "test-continuous-customer"}, "recursion_limit": 20}
-    
-    try:
-        result = graph.invoke(test_input, config=config)
-        print("✅ Continuous customer conversation: PASSED")
-        print(f"   📊 Total messages: {len(result['messages'])}")
-        
-        # Show the conversation flow
-        for i, msg in enumerate(result['messages']):
-            if hasattr(msg, 'name') and msg.name:
-                print(f"   {i+1}. {msg.name}: {type(msg).__name__}")
-            else:
-                print(f"   {i+1}. {type(msg).__name__}")
-        
-        # Check if we got a final response
-        last_msg = result['messages'][-1]
-        if hasattr(last_msg, 'content') and last_msg.content:
-            print(f"   📝 Final response: {last_msg.content[:100]}...")
+            # Show the conversation flow
+            for i, msg in enumerate(result['messages']):
+                if hasattr(msg, 'name') and msg.name:
+                    print(f"   {i+1}. {msg.name}: {type(msg).__name__}")
+                else:
+                    print(f"   {i+1}. {type(msg).__name__}")
             
-    except Exception as e:
-        print(f"❌ Continuous customer conversation: FAILED - {e}")
+            # Check if we got a final response
+            last_msg = result['messages'][-1]
+            if hasattr(last_msg, 'content') and last_msg.content:
+                print(f"   📝 Final response: {last_msg.content[:150]}...")
+                
+        except Exception as e:
+            print(f"❌ Customer follow-up: FAILED - {e}")
+        
+        print("\n" + "=" * 50)
+        print("Customer follow-up test complete!")
     
-    print("\n" + "=" * 50)
-    print("Continuous conversation test complete!")
+    else:
+        # Interactive mode - chat with the bot
+        from langchain_core.messages import HumanMessage
+        
+        print("🤖 SQL Support Bot - Interactive Mode")
+        print("=" * 50)
+        print("Ask me about music or your account information!")
+        print("Type 'quit' or 'exit' to stop.")
+        print("=" * 50)
+        
+        thread_id = "interactive-session"
+        
+        while True:
+            try:
+                # Get user input
+                user_input = input("\n👤 You: ").strip()
+                
+                # Check for exit commands
+                if user_input.lower() in ['quit', 'exit', 'bye', 'goodbye']:
+                    print("\n👋 Goodbye! Thanks for using SQL Support Bot!")
+                    break
+                
+                # Skip empty input
+                if not user_input:
+                    continue
+                
+                # Process the message
+                test_input = {"messages": [HumanMessage(content=user_input)]}
+                config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
+                
+                result = graph.invoke(test_input, config=config)
+                
+                # Get the bot's response
+                if result["messages"]:
+                    last_msg = result["messages"][-1]
+                    if hasattr(last_msg, 'content') and last_msg.content:
+                        print(f"\n🤖 Bot: {last_msg.content}")
+                    else:
+                        print("\n🤖 Bot: [Processing your request...]")
+                else:
+                    print("\n🤖 Bot: I'm not sure how to help with that. Try asking about music or your account!")
+                    
+            except KeyboardInterrupt:
+                print("\n\n👋 Goodbye! Thanks for using SQL Support Bot!")
+                break
+            except Exception as e:
+                print(f"\n❌ Error: {e}")
+                print("Please try again or contact support.")
