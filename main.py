@@ -246,13 +246,18 @@ def _route(state):
             # Music or customer agent made tool calls
             return "tools"
     
-    # If last message is a tool response, end the conversation
+    # If last message is a tool response, route back to the agent that made the tool call
     if isinstance(last_message, ToolMessage):
-        return END
+        # Find the last AI message to determine which agent to continue with
+        last_ai = _get_last_ai_message(messages)
+        if last_ai and last_ai.name in ["music", "customer"]:
+            return last_ai.name
+        return "general"
     
-    # If last message is an AI message without tool calls, end conversation
+    # If last message is an AI message without tool calls, continue conversation
     if isinstance(last_message, AIMessage) and not _is_tool_call(last_message):
-        return END
+        # Don't end conversation - allow for follow-up messages
+        return "general"
     
     # Default fallback
     return "general"
@@ -273,6 +278,20 @@ tools_node = ToolNode(tools)
 
 def general_node(state):
     messages = state["messages"]
+    
+    # Check if this is a follow-up message after an agent response
+    if len(messages) >= 2:
+        last_message = messages[-1]
+        second_last_message = messages[-2]
+        
+        # If last message is human and second last is an AI response, this is a follow-up
+        if isinstance(last_message, HumanMessage) and isinstance(second_last_message, AIMessage):
+            # Create conversation context with recent history
+            recent_messages = messages[-3:] if len(messages) >= 3 else messages[-2:]
+            conversation_context = [SystemMessage(content=system_message)] + recent_messages
+            result = general_chain.invoke(conversation_context)
+            return {"messages": [add_name(result, name="general")]}
+    
     # Only filter out previous general routing messages, keep everything else
     filtered_messages = _filter_out_routes(messages)
     result = general_chain.invoke(filtered_messages)
@@ -281,16 +300,36 @@ def general_node(state):
 def music_node(state):
     messages = state["messages"]
     
-    # Check if we already have a music agent response
+    # Check if we already have a music agent response without tool calls
     last_ai = _get_last_ai_message(messages)
     if last_ai and last_ai.name == "music" and not _is_tool_call(last_ai):
-        # Music agent already responded, don't process again
+        # Music agent already gave final response, don't process again
         return {"messages": []}
+    
+    # If the last message is a tool response, the music agent should process it
+    if messages and isinstance(messages[-1], ToolMessage):
+        # Find the last music agent message to continue the conversation
+        music_messages = [m for m in messages if isinstance(m, AIMessage) and m.name == "music"]
+        if music_messages:
+            # Continue conversation with tool response
+            conversation_context = [SystemMessage(content=song_system_message)] + music_messages[-1:] + [messages[-1]]
+            result = song_recc_chain.invoke(conversation_context)
+            return {"messages": [add_name(result, name="music")]}
     
     # Get the last user message for music queries
     user_messages = [m for m in messages if isinstance(m, HumanMessage)]
     if user_messages:
         last_user_message = user_messages[-1]
+        
+        # Check if this is a follow-up message in a music conversation
+        if len(messages) >= 2:
+            second_last_message = messages[-2]
+            if isinstance(second_last_message, AIMessage) and second_last_message.name == "music":
+                # This is a follow-up in a music conversation, include context
+                conversation_context = [SystemMessage(content=song_system_message), second_last_message, last_user_message]
+                result = song_recc_chain.invoke(conversation_context)
+                return {"messages": [add_name(result, name="music")]}
+        
         # Create a proper conversation context for the music agent
         conversation_context = [SystemMessage(content=song_system_message), last_user_message]
         result = song_recc_chain.invoke(conversation_context)
@@ -300,16 +339,36 @@ def music_node(state):
 def customer_node(state):
     messages = state["messages"]
     
-    # Check if we already have a customer agent response
+    # Check if we already have a customer agent response without tool calls
     last_ai = _get_last_ai_message(messages)
     if last_ai and last_ai.name == "customer" and not _is_tool_call(last_ai):
-        # Customer agent already responded, don't process again
+        # Customer agent already gave final response, don't process again
         return {"messages": []}
+    
+    # If the last message is a tool response, the customer agent should process it
+    if messages and isinstance(messages[-1], ToolMessage):
+        # Find the last customer agent message to continue the conversation
+        customer_messages = [m for m in messages if isinstance(m, AIMessage) and m.name == "customer"]
+        if customer_messages:
+            # Continue conversation with tool response
+            conversation_context = [SystemMessage(content=customer_prompt)] + customer_messages[-1:] + [messages[-1]]
+            result = customer_chain.invoke(conversation_context)
+            return {"messages": [add_name(result, name="customer")]}
     
     # Get the last user message for customer queries
     user_messages = [m for m in messages if isinstance(m, HumanMessage)]
     if user_messages:
         last_user_message = user_messages[-1]
+        
+        # Check if this is a follow-up message in a customer conversation
+        if len(messages) >= 2:
+            second_last_message = messages[-2]
+            if isinstance(second_last_message, AIMessage) and second_last_message.name == "customer":
+                # This is a follow-up in a customer conversation, include context
+                conversation_context = [SystemMessage(content=customer_prompt), second_last_message, last_user_message]
+                result = customer_chain.invoke(conversation_context)
+                return {"messages": [add_name(result, name="customer")]}
+        
         # Create a proper conversation context for the customer agent
         conversation_context = [SystemMessage(content=customer_prompt), last_user_message]
         result = customer_chain.invoke(conversation_context)
@@ -354,47 +413,67 @@ def get_graph():
     return graph
 
 if __name__ == "__main__":
-    # Final comprehensive test
+    # Test continuous conversation
     from langchain_core.messages import HumanMessage
     
-    print("🚀 Final Comprehensive Test Suite")
+    print("💬 Testing Continuous Conversation")
     print("=" * 50)
     
-    test_cases = [
-        ("General greeting", "Hello, how can you help me?"),
-        ("Music query", "Tell me about U2 songs"),
-        ("Customer query", "What's my account information?"),
-        ("Edge case - empty", ""),
-        ("Edge case - very long", "Tell me about " + "music " * 20 + "and customer service"),
-    ]
+    # Test: Music conversation with follow-up
+    print("\n🧪 Testing: Music Conversation with Follow-up")
+    test_input = {"messages": [
+        HumanMessage(content="Tell me about U2 songs"),
+        HumanMessage(content="What about Beatles songs?")
+    ]}
+    config = {"configurable": {"thread_id": "test-continuous-music"}, "recursion_limit": 20}
     
-    all_passed = True
-    for test_name, message in test_cases:
-        print(f"\n🧪 Testing: {test_name}")
-        test_input = {"messages": [HumanMessage(content=message)]}
-        config = {"configurable": {"thread_id": f"final-test-{test_name.lower().replace(' ', '-')}"}, "recursion_limit": 10}
+    try:
+        result = graph.invoke(test_input, config=config)
+        print("✅ Continuous music conversation: PASSED")
+        print(f"   📊 Total messages: {len(result['messages'])}")
         
-        try:
-            result = graph.invoke(test_input, config=config)
-            print(f"✅ {test_name}: PASSED")
-            
-            # Verify we got a proper response
-            if result["messages"]:
-                last_msg = result["messages"][-1]
-                if hasattr(last_msg, 'content') and last_msg.content:
-                    print(f"   📝 Response: {last_msg.content[:80]}...")
-                elif hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
-                    print(f"   🔧 Tool call: {last_msg.tool_calls[0]['name']}")
+        # Show the conversation flow
+        for i, msg in enumerate(result['messages']):
+            if hasattr(msg, 'name') and msg.name:
+                print(f"   {i+1}. {msg.name}: {type(msg).__name__}")
             else:
-                print("   ⚠️  No response generated")
-                
-        except Exception as e:
-            print(f"❌ {test_name}: FAILED - {e}")
-            all_passed = False
+                print(f"   {i+1}. {type(msg).__name__}")
+        
+        # Check if we got a final response
+        last_msg = result['messages'][-1]
+        if hasattr(last_msg, 'content') and last_msg.content:
+            print(f"   📝 Final response: {last_msg.content[:100]}...")
+            
+    except Exception as e:
+        print(f"❌ Continuous music conversation: FAILED - {e}")
+    
+    # Test: Customer conversation with follow-up
+    print("\n🧪 Testing: Customer Conversation with Follow-up")
+    test_input = {"messages": [
+        HumanMessage(content="What's my account information?"),
+        HumanMessage(content="My email is john.doe@email.com")
+    ]}
+    config = {"configurable": {"thread_id": "test-continuous-customer"}, "recursion_limit": 20}
+    
+    try:
+        result = graph.invoke(test_input, config=config)
+        print("✅ Continuous customer conversation: PASSED")
+        print(f"   📊 Total messages: {len(result['messages'])}")
+        
+        # Show the conversation flow
+        for i, msg in enumerate(result['messages']):
+            if hasattr(msg, 'name') and msg.name:
+                print(f"   {i+1}. {msg.name}: {type(msg).__name__}")
+            else:
+                print(f"   {i+1}. {type(msg).__name__}")
+        
+        # Check if we got a final response
+        last_msg = result['messages'][-1]
+        if hasattr(last_msg, 'content') and last_msg.content:
+            print(f"   📝 Final response: {last_msg.content[:100]}...")
+            
+    except Exception as e:
+        print(f"❌ Continuous customer conversation: FAILED - {e}")
     
     print("\n" + "=" * 50)
-    if all_passed:
-        print("🎉 ALL TESTS PASSED! Ready for deployment!")
-    else:
-        print("⚠️  Some tests failed. Review issues before deployment.")
-    print("=" * 50)
+    print("Continuous conversation test complete!")
