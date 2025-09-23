@@ -237,8 +237,10 @@ def _route(state):
             # General agent made a routing decision
             tool_calls = last_message.additional_kwargs['tool_calls']
             if len(tool_calls) > 1:
-                raise ValueError("Multiple tool calls not supported")
-            tool_call = tool_calls[0]
+                # If multiple tool calls, just take the first one
+                tool_call = tool_calls[0]
+            else:
+                tool_call = tool_calls[0]
             return json.loads(tool_call['function']['arguments'])['choice']
         else:
             # Music or customer agent made tool calls
@@ -355,13 +357,31 @@ if __name__ == "__main__":
     # Test the graph locally
     from langchain_core.messages import HumanMessage
     
-    # Test with customer query
-    test_input = {"messages": [HumanMessage(content="What's my account information?")]}
-    config = {"configurable": {"thread_id": "test-thread"}, "recursion_limit": 20}
+    # Test potential recursion scenarios
+    print("Testing potential recursion scenarios...")
     
+    # Test 1: Multiple consecutive messages
+    print("\n1. Testing multiple messages:")
+    test_input = {"messages": [
+        HumanMessage(content="Hello"),
+        HumanMessage(content="Tell me about music")
+    ]}
+    config = {"configurable": {"thread_id": "test-multiple"}, "recursion_limit": 5}
     try:
         result = graph.invoke(test_input, config=config)
-        print("Customer test result:", result)
+        print("✅ Multiple messages: SUCCESS")
     except Exception as e:
-        print("Error:", e)
-        print("This suggests there's an issue with the customer agent flow")
+        print(f"❌ Multiple messages: {e}")
+    
+    # Test 2: Very long message
+    print("\n2. Testing long message:")
+    long_message = "Tell me about " + "music " * 50 + "and also customer service"
+    test_input = {"messages": [HumanMessage(content=long_message)]}
+    config = {"configurable": {"thread_id": "test-long"}, "recursion_limit": 5}
+    try:
+        result = graph.invoke(test_input, config=config)
+        print("✅ Long message: SUCCESS")
+    except Exception as e:
+        print(f"❌ Long message: {e}")
+    
+    print("\nRecursion analysis complete!")
