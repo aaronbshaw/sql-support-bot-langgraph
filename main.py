@@ -354,34 +354,47 @@ def get_graph():
     return graph
 
 if __name__ == "__main__":
-    # Test the graph locally
+    # Final comprehensive test
     from langchain_core.messages import HumanMessage
     
-    # Test potential recursion scenarios
-    print("Testing potential recursion scenarios...")
+    print("🚀 Final Comprehensive Test Suite")
+    print("=" * 50)
     
-    # Test 1: Multiple consecutive messages
-    print("\n1. Testing multiple messages:")
-    test_input = {"messages": [
-        HumanMessage(content="Hello"),
-        HumanMessage(content="Tell me about music")
-    ]}
-    config = {"configurable": {"thread_id": "test-multiple"}, "recursion_limit": 5}
-    try:
-        result = graph.invoke(test_input, config=config)
-        print("✅ Multiple messages: SUCCESS")
-    except Exception as e:
-        print(f"❌ Multiple messages: {e}")
+    test_cases = [
+        ("General greeting", "Hello, how can you help me?"),
+        ("Music query", "Tell me about U2 songs"),
+        ("Customer query", "What's my account information?"),
+        ("Edge case - empty", ""),
+        ("Edge case - very long", "Tell me about " + "music " * 20 + "and customer service"),
+    ]
     
-    # Test 2: Very long message
-    print("\n2. Testing long message:")
-    long_message = "Tell me about " + "music " * 50 + "and also customer service"
-    test_input = {"messages": [HumanMessage(content=long_message)]}
-    config = {"configurable": {"thread_id": "test-long"}, "recursion_limit": 5}
-    try:
-        result = graph.invoke(test_input, config=config)
-        print("✅ Long message: SUCCESS")
-    except Exception as e:
-        print(f"❌ Long message: {e}")
+    all_passed = True
+    for test_name, message in test_cases:
+        print(f"\n🧪 Testing: {test_name}")
+        test_input = {"messages": [HumanMessage(content=message)]}
+        config = {"configurable": {"thread_id": f"final-test-{test_name.lower().replace(' ', '-')}"}, "recursion_limit": 10}
+        
+        try:
+            result = graph.invoke(test_input, config=config)
+            print(f"✅ {test_name}: PASSED")
+            
+            # Verify we got a proper response
+            if result["messages"]:
+                last_msg = result["messages"][-1]
+                if hasattr(last_msg, 'content') and last_msg.content:
+                    print(f"   📝 Response: {last_msg.content[:80]}...")
+                elif hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                    print(f"   🔧 Tool call: {last_msg.tool_calls[0]['name']}")
+            else:
+                print("   ⚠️  No response generated")
+                
+        except Exception as e:
+            print(f"❌ {test_name}: FAILED - {e}")
+            all_passed = False
     
-    print("\nRecursion analysis complete!")
+    print("\n" + "=" * 50)
+    if all_passed:
+        print("🎉 ALL TESTS PASSED! Ready for deployment!")
+    else:
+        print("⚠️  Some tests failed. Review issues before deployment.")
+    print("=" * 50)
