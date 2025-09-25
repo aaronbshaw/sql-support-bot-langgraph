@@ -167,6 +167,8 @@ class Router(BaseModel):
 # Prompts
 customer_prompt = """Your job is to help a user with their account information.
 
+IMPORTANT: Always review the conversation history to understand what the customer has asked about previously. You can reference previous topics, questions, or information they mentioned.
+
 You have access to customer information through the get_customer_info tool. This tool can look up customers by either:
 - Customer ID (a positive number like "1", "5", "10")
 - Email address (exact match like "john.doe@email.com")
@@ -185,6 +187,8 @@ If you are unable to help the user, politely explain what information you need a
 
 song_system_message = """Your job is to help a customer find any songs they are looking for. 
 
+IMPORTANT: Always review the conversation history to understand what the customer has asked about previously. You can reference previous artists, songs, or topics they mentioned.
+
 You only have certain tools you can use. If a customer asks you to look something up that you don't know how, politely tell them what you can help with.
 
 When looking up artists and songs, sometimes the artist/song will not be found. In that case, the tools will return information \
@@ -192,20 +196,46 @@ on simliar songs and artists. This is intentional, it is not the tool messing up
 
 system_message = """Your job is to help as a customer service representative for a music store.
 
-You MUST use the Router tool to direct customers to the appropriate specialist:
+You have TWO options for each customer request:
 
-- If the customer asks about music, songs, albums, artists, playlists, or anything music-related → Call Router with choice="music"
-- If the customer asks about their account, profile, customer information, or account updates → Call Router with choice="customer"
+1. **RESPOND DIRECTLY** if you can answer from the conversation history or if the question or comment is not related to music or their account.
+2. **ROUTE TO SPECIALIST** if you need specialist help related to music or their account.
 
-IMPORTANT: You must ALWAYS use the Router tool. Do not respond with text directly. Use the Router tool for every customer request.
+## When to RESPOND DIRECTLY:
+- Customer asks about previous topics mentioned in conversation
+- Customer asks for reminders or clarifications about what was discussed
+- Customer asks follow-up questions you can answer from context
+- Customer asks "who was the last band we talked about?" or similar memory questions
 
-Examples:
+## When to ROUTE TO SPECIALIST:
+- Customer asks about music, songs, albums, artists, playlists → Router(choice="music")
+- Customer asks about their account, profile, customer information → Router(choice="customer")
+- Customer provides new information that needs specialist processing
+
+## Smart Context Passing:
+When routing to specialists, include relevant context from the conversation:
+- If customer previously mentioned a customer ID or email, pass that context
+- If customer previously asked about a specific artist, include that context
+- Always provide the specialist with the information they need
+
+## Examples:
 - "find songs by U2" → Router(choice="music")
-- "do you have heavy metal playlist?" → Router(choice="music") 
-- "what email do you have for me?" → Router(choice="customer")
-- "update my address" → Router(choice="customer")
-- "hi" → Router(choice="music")  # Default to music for greetings
-- "hello" → Router(choice="music")  # Default to music for greetings"""
+- "who was the last band we talked about?" → Respond directly: "We were discussing AC/DC"
+- "what's my email?" → Router(choice="customer") with context: "Customer previously provided ID: 3"
+- "tell me about my account again" → Router(choice="customer") with context: "Customer ID: 3 from previous conversation"
+
+IMPORTANT: Use Router tool when you need specialist help, respond directly when you can answer from conversation history.
+
+When tools have been called and you receive tool responses, you must:
+1) If the tool output answers the user's request, reply to the user in clear natural language using the tool results. Do not route again.
+2) If the tool output is insufficient to answer the user, ask a concise follow-up question for the exact missing information needed. Only route again if a different specialist is required.
+
+Routing rules:
+- Base your routing decision on the latest user message. Only if the latest message is ambiguous, ask a follow-up question. Do not consider older messages for routing.
+- Emit EXACTLY ONE call to the Router tool (choose one of: music OR customer). Never call both.
+- Do not route if you can answer directly from history.
+
+When routing to a specialist, include a one-sentence Handoff summary in your assistant message content and avoid including raw history. Include only: intent, customer_id/email (if any), relevant entities (artist/album/playlist), and the latest user utterance verbatim."""
 
 # Chains
 def get_customer_messages(messages):
@@ -262,17 +292,13 @@ def _route(state):
             # Music or customer agent made tool calls
             return "tools"
     
-    # If last message is a tool response, route back to the agent that made the tool call
+    # If last message is a tool response, always route back to general
     if isinstance(last_message, ToolMessage):
-        # Find the last AI message to determine which agent to continue with
-        last_ai = _get_last_ai_message(messages)
-        if last_ai and last_ai.name in ["music", "customer"]:
-            return last_ai.name  # Music/customer agents continue after tool execution
-        return "general"  # General agent goes back to general
+        return "general"
     
-    # If last message is an AI message without tool calls, end conversation
+    # If last message is an AI message without tool calls, wait for user input
     if isinstance(last_message, AIMessage) and not _is_tool_call(last_message):
-        return END  # End conversation after agent response
+        return END  # End this turn, wait for next user input
     
     # Default fallback
     return "general"
@@ -287,6 +313,19 @@ def _filter_out_routes(messages):
         ms.append(m)
     return ms
 
+def _filter_incomplete_tool_calls(messages):
+    """Filter out incomplete tool call sequences to avoid OpenAI errors."""
+    if not messages:
+        return messages
+    
+    # Only pass the last human message to avoid recursion loops
+    # The checkpointer maintains full conversation history, but we only need current context
+    human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    if human_messages:
+        return [human_messages[-1]]  # Only the most recent human message
+    
+    return messages
+
 # Node definitions
 tools = [get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_customer_info, get_songs_in_playlist]
 tools_node = ToolNode(tools)
@@ -294,104 +333,112 @@ tools_node = ToolNode(tools)
 def general_node(state):
     messages = state["messages"]
     
-    # Check if this looks like a follow-up to a previous conversation
-    if len(messages) >= 2:
-        last_message = messages[-1]
-        second_last_message = messages[-2]
-        
-        # If last message is human and second last is an AI response asking for info
-        if (isinstance(last_message, HumanMessage) and 
-            isinstance(second_last_message, AIMessage) and 
-            second_last_message.name in ["customer", "music"]):
-            
-            # This is likely a follow-up, include context
-            conversation_context = [SystemMessage(content=system_message), second_last_message, last_message]
-            result = general_chain.invoke(conversation_context)
-            return {"messages": [add_name(result, name="general")]}
-    
-    # Get the last human message for routing
+    # For general agent, pass full conversation context for smart routing and responses
+    # Include all human messages and recent safe AI responses (no tool calls)
+    # Do NOT include raw ToolMessage objects (they must follow tool_calls). Instead, summarize them.
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
-    if human_messages:
-        last_human_message = human_messages[-1]
-        # Create a fresh context with just the system message and the latest human message
-        conversation_context = [SystemMessage(content=system_message), last_human_message]
-        result = general_chain.invoke(conversation_context)
-        return {"messages": [add_name(result, name="general")]}
+    ai_messages = [m for m in messages if isinstance(m, AIMessage)]
+    tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
     
-    # Fallback - filter out previous general routing messages
-    filtered_messages = _filter_out_routes(messages)
-    result = general_chain.invoke(filtered_messages)
+    # Filter out AI messages with tool calls to avoid OpenAI errors
+    safe_ai_messages = []
+    for ai_msg in ai_messages:
+        if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
+            safe_ai_messages.append(ai_msg)
+    
+    # Build context
+    conversation_context = [SystemMessage(content=system_message)]
+    
+    # Heuristic: if the latest user message looks like a memory/history question,
+    # include a small recent window of messages; otherwise only include the latest user message.
+    def _looks_like_memory_question(text: str) -> bool:
+        text_l = text.lower()
+        keywords = [
+            "what was the last", "what did we talk about", "what did i ask",
+            "remind me", "previous", "earlier", "before", "who was the last",
+        ]
+        return any(k in text_l for k in keywords)
+
+    if human_messages:
+        latest_human = human_messages[-1]
+        if isinstance(latest_human, HumanMessage) and _looks_like_memory_question(latest_human.content or ""):
+            # Include small recent window: last 3 human + last 3 safe AI
+            recent_humans = human_messages[-3:] if len(human_messages) > 3 else human_messages
+            for hm in recent_humans:
+                conversation_context.append(hm)
+            recent_safe_ai = safe_ai_messages[-3:] if len(safe_ai_messages) > 3 else safe_ai_messages
+            for am in recent_safe_ai:
+                conversation_context.append(am)
+        else:
+            # Default: only the latest user message to drive routing
+            conversation_context.append(latest_human)
+    
+    # Add recent safe AI responses for context (last 5)
+    recent_safe_ai = safe_ai_messages[-5:] if len(safe_ai_messages) > 5 else safe_ai_messages
+    conversation_context.extend(recent_safe_ai)
+    
+    # Summarize recent tool outputs for safe inclusion
+    if tool_messages:
+        recent_tools = tool_messages[-5:] if len(tool_messages) > 5 else tool_messages
+        # Create a compact summary string of tool outputs
+        tool_summaries = []
+        for tm in recent_tools:
+            name = getattr(tm, "name", "tool")
+            content = tm.content if hasattr(tm, "content") and isinstance(tm.content, str) else str(tm.content)
+            # Truncate overly long tool content
+            if len(content) > 800:
+                content = content[:800] + "..."
+            tool_summaries.append(f"{name}: {content}")
+        tools_summary_text = "\n".join(tool_summaries)
+        conversation_context.append(SystemMessage(content=f"Tool results summary (most recent first):\n{tools_summary_text}"))
+    
+    result = general_chain.invoke(conversation_context)
     return {"messages": [add_name(result, name="general")]}
 
 def music_node(state):
     messages = state["messages"]
     
-    # Check if we already have a music agent response without tool calls
-    last_ai = _get_last_ai_message(messages)
-    if last_ai and last_ai.name == "music" and not _is_tool_call(last_ai):
-        # Music agent already gave final response, don't process again
-        return {"messages": []}
+    # For music agent, only pass the current request - no history to avoid recursion
+    # Just get the most recent human message
+    human_messages = [m for m in messages if isinstance(m, HumanMessage)]
     
-    # If the last message is a tool response, the music agent should process it
-    if messages and isinstance(messages[-1], ToolMessage):
-        # Find the last music agent message to continue the conversation
-        music_messages = [m for m in messages if isinstance(m, AIMessage) and m.name == "music"]
-        if music_messages:
-            # Continue conversation with tool response
-            conversation_context = [SystemMessage(content=song_system_message)] + music_messages[-1:] + [messages[-1]]
-            result = song_recc_chain.invoke(conversation_context)
-            return {"messages": [add_name(result, name="music")]}
+    # Build context: just the current request
+    conversation_context = [SystemMessage(content=song_system_message)]
     
-    # Get the last user message for music queries
-    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
-    if user_messages:
-        last_user_message = user_messages[-1]
-        # Create a proper conversation context for the music agent
-        conversation_context = [SystemMessage(content=song_system_message), last_user_message]
-        result = song_recc_chain.invoke(conversation_context)
-        return {"messages": [add_name(result, name="music")]}
-    return {"messages": []}
+    # Only add the most recent human message (current request)
+    if human_messages:
+        conversation_context.append(human_messages[-1])
+    
+    result = song_recc_chain.invoke(conversation_context)
+    return {"messages": [add_name(result, name="music")]}
 
 def customer_node(state):
     messages = state["messages"]
     
-    # Check if we already have a customer agent response without tool calls
-    last_ai = _get_last_ai_message(messages)
-    if last_ai and last_ai.name == "customer" and not _is_tool_call(last_ai):
-        # Customer agent already gave final response, don't process again
-        return {"messages": []}
+    # For customer agent, pass recent conversation context for better responses
+    # Include recent human messages and safe AI responses (no tool calls)
+    human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    ai_messages = [m for m in messages if isinstance(m, AIMessage)]
     
-    # If the last message is a tool response, the customer agent should process it
-    if messages and isinstance(messages[-1], ToolMessage):
-        # Find the last customer agent message to continue the conversation
-        customer_messages = [m for m in messages if isinstance(m, AIMessage) and m.name == "customer"]
-        if customer_messages:
-            # Continue conversation with tool response
-            conversation_context = [SystemMessage(content=customer_prompt)] + customer_messages[-1:] + [messages[-1]]
-            result = customer_chain.invoke(conversation_context)
-            return {"messages": [add_name(result, name="customer")]}
+    # Filter out AI messages with tool calls to avoid OpenAI errors
+    safe_ai_messages = []
+    for ai_msg in ai_messages:
+        if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
+            safe_ai_messages.append(ai_msg)
     
-    # Get the last user message for customer queries
-    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
-    if user_messages:
-        last_user_message = user_messages[-1]
-        
-        # Check if this is a follow-up message (like providing an ID after being asked)
-        if len(messages) >= 2:
-            second_last_message = messages[-2]
-            if (isinstance(second_last_message, AIMessage) and 
-                second_last_message.name == "customer" and
-                ("ID" in second_last_message.content or "email" in second_last_message.content.lower())):
-                # This is a follow-up with customer info, include the previous context
-                conversation_context = [SystemMessage(content=customer_prompt), second_last_message, last_user_message]
-                result = customer_chain.invoke(conversation_context)
-                return {"messages": [add_name(result, name="customer")]}
-        
-        # Create a proper conversation context for the customer agent
-        conversation_context = [SystemMessage(content=customer_prompt), last_user_message]
-        result = customer_chain.invoke(conversation_context)
-        return {"messages": [add_name(result, name="customer")]}
-    return {"messages": []}
+    # Build context: recent human messages + safe AI context
+    conversation_context = [SystemMessage(content=customer_prompt)]
+    
+    # Add recent human messages (last 3 for context)
+    recent_human = human_messages[-3:] if len(human_messages) > 3 else human_messages
+    conversation_context.extend(recent_human)
+    
+    # Add any recent safe AI messages for context (last 2)
+    recent_safe_ai = safe_ai_messages[-2:] if len(safe_ai_messages) > 2 else safe_ai_messages
+    conversation_context.extend(recent_safe_ai)
+    
+    result = customer_chain.invoke(conversation_context)
+    return {"messages": [add_name(result, name="customer")]}
 
 # Graph definition
 def create_graph():
@@ -411,6 +458,7 @@ def create_graph():
     workflow.add_node("tools", tools_node)
     
     # Add edges with proper routing restrictions
+    workflow.add_edge(START, "general") #always start with general
     workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", "tools": "tools", "general": "general", END: END})
     workflow.add_conditional_edges("tools", _route, {"general": "general", "music": "music", "customer": "customer", END: END})  # Tools can go back to any agent
     workflow.add_conditional_edges("music", _route, {"tools": "tools", "music": "music", END: END})  # Music can go to tools or continue
@@ -482,7 +530,13 @@ if __name__ == "__main__":
         print("Type 'quit' or 'exit' to stop.")
         print("=" * 50)
         
-        thread_id = "interactive-session"
+        # Get user ID for conversation thread
+        user_id = input("\n👤 Please enter your user ID: ").strip()
+        if not user_id:
+            user_id = "anonymous-user"
+        
+        thread_id = f"user-{user_id}"
+        print(f"📝 Starting conversation thread: {thread_id}")
         
         while True:
             try:
@@ -498,19 +552,28 @@ if __name__ == "__main__":
                 if not user_input:
                     continue
                 
-                # Process the message
-                test_input = {"messages": [HumanMessage(content=user_input)]}
+                # Process the message - checkpointer automatically maintains conversation history
+                graph_input = {"messages": [HumanMessage(content=user_input)]}
                 config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
                 
-                result = graph.invoke(test_input, config=config)
+                result = graph.invoke(graph_input, config=config)
                 
                 # Get the bot's response
                 if result["messages"]:
                     last_msg = result["messages"][-1]
-                    if hasattr(last_msg, 'content') and last_msg.content:
-                        print(f"\n🤖 Bot: {last_msg.content}")
+                    bot_name = getattr(last_msg, 'name', None)
+                    if bot_name == "general":
+                        bot_label = "General Bot"
+                    elif bot_name == "music":
+                        bot_label = "Music Bot"
+                    elif bot_name == "customer":
+                        bot_label = "Customer Bot"
                     else:
-                        print("\n🤖 Bot: [Processing your request...]")
+                        bot_label = "Bot"
+                    if hasattr(last_msg, 'content') and last_msg.content:
+                        print(f"\n🤖 {bot_label}: {last_msg.content}")
+                    else:
+                        print(f"\n🤖 {bot_label}: [Processing your request...]")
                 else:
                     print("\n🤖 Bot: I'm not sure how to help with that. Try asking about music or your account!")
                     
