@@ -9,17 +9,19 @@ import sqlite3
 import requests
 import json
 from functools import partial
-from typing import Dict, Any, List
+from typing import Dict, Any, List, TypedDict, Annotated
 from dotenv import load_dotenv
-
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, add_messages
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities.sql_database import SQLDatabase
-from langgraph.graph import StateGraph, END, START
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.sqlite import SqliteSaver
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from pydantic import BaseModel, Field
+
+
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
@@ -52,6 +54,14 @@ def get_engine_for_chinook_db():
 
 engine = get_engine_for_chinook_db()
 db = SQLDatabase(engine)
+
+# Define the memory (short-term memory with thread-level persistence)
+from langgraph.checkpoint.sqlite import SqliteSaver
+memory = SqliteSaver.from_conn_string(":memory:")
+
+# Define the state schema for StateGraph
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
 
 # Tools
 @tool
@@ -403,8 +413,8 @@ def create_graph():
     # Set entry point
     workflow.set_conditional_entry_point(_route, {"music": "music", "customer": "customer", "general": "general", "tools": "tools", END: END})
     
-    # Compile without checkpointer for now
-    return workflow.compile()
+    # Compile with checkpointer for thread-level persistence
+    return workflow.compile(checkpointer=memory)
 
 # Create the graph instance
 graph = create_graph()
