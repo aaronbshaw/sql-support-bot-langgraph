@@ -261,8 +261,8 @@ def _route(state):
         # Find the last AI message to determine which agent to continue with
         last_ai = _get_last_ai_message(messages)
         if last_ai and last_ai.name in ["music", "customer"]:
-            return last_ai.name
-        return "general"
+            return last_ai.name  # Music/customer agents continue after tool execution
+        return "general"  # General agent goes back to general
     
     # If last message is an AI message without tool calls, end conversation
     if isinstance(last_message, AIMessage) and not _is_tool_call(last_message):
@@ -404,11 +404,11 @@ def create_graph():
     workflow.add_node("customer", customer_node)
     workflow.add_node("tools", tools_node)
     
-    # Add edges
+    # Add edges with proper routing restrictions
     workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", "tools": "tools", END: END})
-    workflow.add_conditional_edges("tools", _route, {"music": "music", "customer": "customer", "general": "general", END: END})
-    workflow.add_conditional_edges("music", _route, {"music": "music", "customer": "customer", "general": "general", "tools": "tools", END: END})
-    workflow.add_conditional_edges("customer", _route, {"music": "music", "customer": "customer", "general": "general", "tools": "tools", END: END})
+    workflow.add_conditional_edges("tools", _route, {"general": "general", "music": "music", "customer": "customer", END: END})  # Tools can go back to any agent
+    workflow.add_conditional_edges("music", _route, {"tools": "tools", "music": "music", END: END})  # Music can go to tools or continue
+    workflow.add_conditional_edges("customer", _route, {"tools": "tools", "customer": "customer", END: END})  # Customer can go to tools or continue
     
     # Set entry point
     workflow.set_conditional_entry_point(_route, {"music": "music", "customer": "customer", "general": "general", "tools": "tools", END: END})
