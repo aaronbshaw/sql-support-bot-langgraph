@@ -11,10 +11,10 @@ import json
 from functools import partial
 from typing import Dict, Any, List, TypedDict, Annotated
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, START, END, add_messages
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, add_messages
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities.sql_database import SQLDatabase
 from sqlalchemy import create_engine
@@ -56,8 +56,8 @@ engine = get_engine_for_chinook_db()
 db = SQLDatabase(engine)
 
 # Define the memory (short-term memory with thread-level persistence)
-from langgraph.checkpoint.sqlite import SqliteSaver
-memory = SqliteSaver.from_conn_string(":memory:")
+from langgraph.checkpoint.memory import MemorySaver
+memory = MemorySaver()
 
 # Define the state schema for StateGraph
 class State(TypedDict):
@@ -192,14 +192,20 @@ on simliar songs and artists. This is intentional, it is not the tool messing up
 
 system_message = """Your job is to help as a customer service representative for a music store.
 
-You should interact politely with customers to try to figure out how you can help. You can help in a few ways:
+You MUST use the Router tool to direct customers to the appropriate specialist:
 
-- Updating user information: if a customer wants to update the information in the user database. Call the router with `customer`
-- Recomending music: if a customer wants to find some music or information about music. Call the router with `music`
+- If the customer asks about music, songs, albums, artists, playlists, or anything music-related → Call Router with choice="music"
+- If the customer asks about their account, profile, customer information, or account updates → Call Router with choice="customer"
 
-If the user is asking or wants to ask about updating or accessing their information, send them to that route.
-If the user is asking or wants to ask about music, send them to that route.
-Otherwise, respond."""
+IMPORTANT: You must ALWAYS use the Router tool. Do not respond with text directly. Use the Router tool for every customer request.
+
+Examples:
+- "find songs by U2" → Router(choice="music")
+- "do you have heavy metal playlist?" → Router(choice="music") 
+- "what email do you have for me?" → Router(choice="customer")
+- "update my address" → Router(choice="customer")
+- "hi" → Router(choice="music")  # Default to music for greetings
+- "hello" → Router(choice="music")  # Default to music for greetings"""
 
 # Chains
 def get_customer_messages(messages):
@@ -266,7 +272,7 @@ def _route(state):
     
     # If last message is an AI message without tool calls, end conversation
     if isinstance(last_message, AIMessage) and not _is_tool_call(last_message):
-        return END
+        return END  # End conversation after agent response
     
     # Default fallback
     return "general"
@@ -405,7 +411,7 @@ def create_graph():
     workflow.add_node("tools", tools_node)
     
     # Add edges with proper routing restrictions
-    workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", "tools": "tools", END: END})
+    workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", "tools": "tools", "general": "general", END: END})
     workflow.add_conditional_edges("tools", _route, {"general": "general", "music": "music", "customer": "customer", END: END})  # Tools can go back to any agent
     workflow.add_conditional_edges("music", _route, {"tools": "tools", "music": "music", END: END})  # Music can go to tools or continue
     workflow.add_conditional_edges("customer", _route, {"tools": "tools", "customer": "customer", END: END})  # Customer can go to tools or continue
