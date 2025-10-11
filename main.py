@@ -100,6 +100,62 @@ def get_customer_info(identifier: str):
         return f"Error retrieving customer information: {str(e)}. Please try again or contact support."
 
 @tool
+def update_customer_info(customer_id: str, field_name: str, new_value: str):
+    """Update a customer's information in the database.
+    
+    Args:
+        customer_id: The customer ID (must be a positive integer)
+        field_name: The field to update. Valid fields are: FirstName, LastName, Company, 
+                   Address, City, State, Country, PostalCode, Phone, Fax, Email
+        new_value: The new value for the field
+        
+    Examples:
+        - update_customer_info("1", "Phone", "+1 555-0123")
+        - update_customer_info("5", "Email", "newemail@example.com")
+        - update_customer_info("10", "Address", "123 New Street")
+    
+    Returns:
+        Success message with updated info, or error message if update failed
+    """
+    try:
+        # Validate customer_id is a number
+        if not customer_id.isdigit():
+            return f"Error: Customer ID must be a number. You provided: {customer_id}"
+        
+        cid = int(customer_id)
+        if cid <= 0:
+            return f"Error: Customer ID must be a positive integer. You provided: {cid}"
+        
+        # Validate field_name (only allow specific fields, NOT CustomerId)
+        valid_fields = [
+            "FirstName", "LastName", "Company", "Address", "City", 
+            "State", "Country", "PostalCode", "Phone", "Fax", "Email"
+        ]
+        
+        if field_name not in valid_fields:
+            return f"Error: Invalid field name '{field_name}'. Valid fields are: {', '.join(valid_fields)}"
+        
+        # First, verify customer exists
+        check_result = db.run(f"SELECT CustomerId FROM Customer WHERE CustomerId = {cid};")
+        if not check_result or check_result.strip() == "":
+            return f"Error: No customer found with ID {cid}. Cannot update."
+        
+        # Escape single quotes in new_value to prevent SQL injection
+        escaped_value = new_value.replace("'", "''")
+        
+        # Perform the update
+        update_query = f"UPDATE Customer SET {field_name} = '{escaped_value}' WHERE CustomerId = {cid};"
+        db.run(update_query)
+        
+        # Verify the update by fetching the updated record
+        result = db.run(f"SELECT * FROM Customer WHERE CustomerId = {cid};")
+        
+        return f"Successfully updated {field_name} for customer ID {cid}. Updated customer info:\n{result}"
+        
+    except Exception as e:
+        return f"Error updating customer info: {str(e)}"
+
+@tool
 def get_albums_by_artist(artist: str):
     """Get albums by an artist."""
     # Escape single quotes to prevent SQL injection
@@ -169,19 +225,24 @@ customer_prompt = """Your job is to help a user with their account information.
 
 IMPORTANT: Always review the conversation history to understand what the customer has asked about previously. You can reference previous topics, questions, or information they mentioned.
 
-You have access to customer information through the get_customer_info tool. This tool can look up customers by either:
-- Customer ID (a positive number like "1", "5", "10")
-- Email address (exact match like "john.doe@email.com")
+You have access to two customer tools:
+
+1. get_customer_info - Look up customer information by:
+   - Customer ID (a positive number like "1", "5", "10")
+   - Email address (exact match like "john.doe@email.com")
+
+2. update_customer_info - Update customer information fields:
+   - Valid fields: FirstName, LastName, Company, Address, City, State, Country, PostalCode, Phone, Fax, Email
+   - Requires: customer_id, field_name, new_value
+   - Example: update_customer_info("1", "Phone", "+1 555-0123")
 
 IMPORTANT GUIDELINES:
 1. Ask the user for their customer ID or email address before looking up their information
 2. If the user doesn't know their customer ID, ask for their email address instead
-3. If there's an error or no customer found, explain the issue clearly
-4. Be helpful and guide the user through the process
-5. Email addresses must be exact matches - partial matches will not work
-
-Available tools:
-- get_customer_info: Look up customer information by ID or exact email
+3. Before updating, verify the customer ID and confirm what field they want to update
+4. After updating, show the user their updated information
+5. If there's an error or no customer found, explain the issue clearly
+6. Email addresses must be exact matches - partial matches will not work
 
 If you are unable to help the user, politely explain what information you need and suggest they contact support if needed."""
 
@@ -249,7 +310,7 @@ def get_song_messages(messages):
 def get_messages(messages):
     return [SystemMessage(content=system_message)] + messages
 
-customer_chain = get_customer_messages | model.bind_tools([get_customer_info])
+customer_chain = get_customer_messages | model.bind_tools([get_customer_info, update_customer_info])
 song_recc_chain = get_song_messages | model.bind_tools([get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_songs_in_playlist])
 general_chain = get_messages | model.bind_tools([Router])
 
@@ -318,8 +379,20 @@ def _route(state):
             # Music agent made tool calls - route to music_tools
             return "music_tools"
         elif last_message.name == "customer":
-            # Customer agent made tool calls - route to customer_tools
-            return "customer_tools"
+            # Customer agent made tool calls - check if sensitive or safe
+            tool_calls = last_message.additional_kwargs.get('tool_calls', [])
+            if tool_calls:
+                tool_call = tool_calls[0]
+                tool_name = tool_call['function']['name']
+                
+                # Check if this is a sensitive operation
+                if tool_name == "update_customer_info":
+                    # Route to sensitive tools (interrupt will pause before execution)
+                    return "customer_sensitive_tools"
+                else:
+                    # Safe operation - go directly to safe tools
+                    return "customer_safe_tools"
+            return "customer_safe_tools"  # Default to safe tools
         else:
             # Unknown agent with tool calls
             return "general"
@@ -377,10 +450,12 @@ def _filter_incomplete_tool_calls(messages):
 
 # Node definitions
 music_tools = [get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_songs_in_playlist]
-customer_tools = [get_customer_info]
+customer_safe_tools = [get_customer_info]
+customer_sensitive_tools = [update_customer_info]   # This tool is only used for sensitive information like updating email or phone number
 
 music_tools_node = ToolNode(music_tools)
-customer_tools_node = ToolNode(customer_tools)
+customer_safe_tools_node = ToolNode(customer_safe_tools)
+customer_sensitive_tools_node = ToolNode(customer_sensitive_tools)
 
 def general_node(state):
     messages = state["messages"]
@@ -434,26 +509,35 @@ def music_node(state):
     
     # Extract message types
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
-    tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
     
     # Build context with conversation history
     conversation_context = [SystemMessage(content=song_system_message)]
     
-    # Include recent human messages (last 3) for context
-    recent_humans = human_messages[-3:] if len(human_messages) > 3 else human_messages
-    for hm in recent_humans:
-        conversation_context.append(hm)
+    # Only include the MOST RECENT human message (current request)
+    # Including multiple human messages confuses the LLM about which request to answer
+    if human_messages:
+        conversation_context.append(human_messages[-1])
     
-    # Include tool results if available (for formulating responses with data)
-    if tool_messages:
-        recent_tools = tool_messages[-3:] if len(tool_messages) > 3 else tool_messages
-        for tm in recent_tools:
-            # Add tool results as system messages for context
-            content = tm.content if hasattr(tm, 'content') and isinstance(tm.content, str) else str(tm.content)
-            if len(content) > 1000:
-                content = content[:1000] + "..."
-            tool_name = getattr(tm, "name", "tool")
-            conversation_context.append(SystemMessage(content=f"Tool result from {tool_name}: {content}"))
+    # Only include tool results from the CURRENT turn (after the last human message)
+    # Find the index of the most recent human message
+    if human_messages:
+        last_human_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], HumanMessage):
+                last_human_idx = i
+                break
+        
+        # Get tool messages that came after the last human message
+        if last_human_idx is not None:
+            current_turn_tools = [m for m in messages[last_human_idx:] if isinstance(m, ToolMessage)]
+            
+            # Include these tool results for formulating response
+            for tm in current_turn_tools:
+                content = tm.content if hasattr(tm, 'content') and isinstance(tm.content, str) else str(tm.content)
+                if len(content) > 1000:
+                    content = content[:1000] + "..."
+                tool_name = getattr(tm, "name", "tool")
+                conversation_context.append(SystemMessage(content=f"Tool result from {tool_name}: {content}"))
     
     result = song_recc_chain.invoke(conversation_context)
     return {"messages": [add_name(result, name="music")]}
@@ -465,7 +549,6 @@ def customer_node(state):
     # Include recent human messages and safe AI responses (no tool calls)
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
     ai_messages = [m for m in messages if isinstance(m, AIMessage)]
-    tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
     
     # Filter out AI messages with tool calls to avoid OpenAI errors
     safe_ai_messages = []
@@ -476,24 +559,35 @@ def customer_node(state):
     # Build context: recent human messages + safe AI context
     conversation_context = [SystemMessage(content=customer_prompt)]
     
-    # Add recent human messages (last 3 for context)
-    recent_human = human_messages[-3:] if len(human_messages) > 3 else human_messages
+    # Include recent human messages (last 2 for context of multi-turn conversations)
+    # E.g., "What's my account?" followed by "My ID is 5"
+    recent_human = human_messages[-2:] if len(human_messages) > 2 else human_messages
     conversation_context.extend(recent_human)
     
-    # Add any recent safe AI messages for context (last 2)
-    recent_safe_ai = safe_ai_messages[-2:] if len(safe_ai_messages) > 2 else safe_ai_messages
-    conversation_context.extend(recent_safe_ai)
+    # Add the most recent safe AI message for context
+    if safe_ai_messages:
+        conversation_context.append(safe_ai_messages[-1])
     
-    # Include tool results if available (for formulating responses with data)
-    if tool_messages:
-        recent_tools = tool_messages[-3:] if len(tool_messages) > 3 else tool_messages
-        for tm in recent_tools:
-            # Add tool results as system messages for context
-            content = tm.content if hasattr(tm, 'content') and isinstance(tm.content, str) else str(tm.content)
-            if len(content) > 1000:
-                content = content[:1000] + "..."
-            tool_name = getattr(tm, "name", "tool")
-            conversation_context.append(SystemMessage(content=f"Tool result from {tool_name}: {content}"))
+    # Only include tool results from the CURRENT turn (after the last human message)
+    # Find the index of the most recent human message
+    if human_messages:
+        last_human_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], HumanMessage):
+                last_human_idx = i
+                break
+        
+        # Get tool messages that came after the last human message
+        if last_human_idx is not None:
+            current_turn_tools = [m for m in messages[last_human_idx:] if isinstance(m, ToolMessage)]
+            
+            # Include these tool results for formulating response
+            for tm in current_turn_tools:
+                content = tm.content if hasattr(tm, 'content') and isinstance(tm.content, str) else str(tm.content)
+                if len(content) > 1000:
+                    content = content[:1000] + "..."
+                tool_name = getattr(tm, "name", "tool")
+                conversation_context.append(SystemMessage(content=f"Tool result from {tool_name}: {content}"))
     
     result = customer_chain.invoke(conversation_context)
     return {"messages": [add_name(result, name="customer")]}
@@ -514,20 +608,31 @@ def create_graph():
     workflow.add_node("music", music_node)
     workflow.add_node("customer", customer_node)
     workflow.add_node("music_tools", music_tools_node)
-    workflow.add_node("customer_tools", customer_tools_node)
+    workflow.add_node("customer_safe_tools", customer_safe_tools_node)
+    workflow.add_node("customer_sensitive_tools", customer_sensitive_tools_node)
     
     # Add edges with proper routing restrictions
     workflow.add_edge(START, "general") #always start with general
-    workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", "general": "general", END: END})
+    workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", END: END})
+    
     # Specialist agents can route to their tools, back to themselves, to general, or END
-    workflow.add_conditional_edges("music", _route, {"music_tools": "music_tools", "music": "music", "general": "general", END: END})
-    workflow.add_conditional_edges("customer", _route, {"customer_tools": "customer_tools", "customer": "customer", "general": "general", END: END})
-    # Tools route back to their specialist agent or to general
-    workflow.add_conditional_edges("music_tools", _route, {"music": "music", "general": "general"})
-    workflow.add_conditional_edges("customer_tools", _route, {"customer": "customer", "general": "general"})
+    workflow.add_conditional_edges("music", _route, {"music_tools": "music_tools", "general": "general", END: END})
+    workflow.add_conditional_edges("customer", _route, {
+        "customer_safe_tools": "customer_safe_tools", 
+        "customer_sensitive_tools": "customer_sensitive_tools",
+        "general": "general", 
+        END: END
+    })
+    
+    # Tools route back to their specialist agent
+    workflow.add_conditional_edges("music_tools", _route, {"music": "music"})
+    workflow.add_conditional_edges("customer_safe_tools", _route, {"customer": "customer"})
+    workflow.add_conditional_edges("customer_sensitive_tools", _route, {"customer": "customer"})
     
     # Compile with checkpointer for thread-level persistence
-    return workflow.compile(checkpointer=memory)
+    # interrupt_before will pause execution BEFORE the customer_sensitive_tools node executes
+    # This provides human-in-the-loop approval for sensitive operations
+    return workflow.compile(checkpointer=memory, interrupt_before=["customer_sensitive_tools"])
 
 # Create the graph instance
 graph = create_graph()
@@ -624,6 +729,94 @@ if __name__ == "__main__":
         
         print("\n" + "=" * 50)
         print("Customer follow-up test complete!")
+        
+        # Test music query to check for duplicate responses
+        print("\n" + "=" * 50)
+        print("🧪 Testing Music Query - No Duplicates")
+        print("=" * 50)
+        
+        # Create a fresh thread for this test
+        music_config = {"configurable": {"thread_id": "test-music-no-duplicates"}, "recursion_limit": 25}
+        
+        try:
+            # Step 1: Ask about U2
+            print("\n📨 Step 1: User asks about U2 songs")
+            test_music_1 = {"messages": [HumanMessage(content="Show me some songs by U2")]}
+            result_m1 = graph.invoke(test_music_1, config=music_config)
+            last_msg_1 = result_m1['messages'][-1]
+            if hasattr(last_msg_1, 'content'):
+                response_1 = last_msg_1.content
+                print(f"   Response length: {len(response_1)} chars")
+                print(f"   Preview: {response_1[:200]}...")
+            
+            # Step 2: Ask about AC/DC
+            print("\n📨 Step 2: User asks about AC/DC songs")
+            test_music_2 = {"messages": [HumanMessage(content="Now show me songs by AC/DC")]}
+            result_m2 = graph.invoke(test_music_2, config=music_config)
+            last_msg_2 = result_m2['messages'][-1]
+            if hasattr(last_msg_2, 'content'):
+                response_2 = last_msg_2.content
+                print(f"   Response length: {len(response_2)} chars")
+                print(f"   Preview: {response_2[:200]}...")
+                
+                # Check if U2 is mentioned in the AC/DC response (it shouldn't be)
+                if "U2" in response_2 or "u2" in response_2.lower():
+                    print("\n   ⚠️  WARNING: U2 mentioned in AC/DC response - possible duplicate issue")
+                else:
+                    print("\n   ✅ No duplicate data - U2 not mentioned in AC/DC response")
+            
+            print("\n✅ Music query test: PASSED")
+                
+        except Exception as e:
+            print(f"\n❌ Music query test: FAILED - {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print("\n" + "=" * 50)
+        print("Music query test complete!")
+        
+        # Test customer update functionality
+        print("\n" + "=" * 50)
+        print("🧪 Testing Customer Update")
+        print("=" * 50)
+        
+        # Create a fresh thread for this test
+        update_config = {"configurable": {"thread_id": "test-customer-update"}, "recursion_limit": 50}
+        
+        try:
+            # Step 1: Get current customer info
+            print("\n📨 Step 1: Get current customer info (ID 1)")
+            test_get = {"messages": [HumanMessage(content="Show me the info for customer ID 1")]}
+            result_get = graph.invoke(test_get, config=update_config)
+            last_msg_get = result_get['messages'][-1]
+            if hasattr(last_msg_get, 'content'):
+                print(f"   Preview: {last_msg_get.content[:200]}...")
+            
+            # Step 2: Update the phone number
+            print("\n📨 Step 2: Update phone number for customer 1")
+            test_update = {"messages": [HumanMessage(content="Please update the phone number for customer 1 to +1 555-TEST-123")]}
+            result_update = graph.invoke(test_update, config=update_config)
+            last_msg_update = result_update['messages'][-1]
+            if hasattr(last_msg_update, 'content'):
+                response_update = last_msg_update.content
+                print(f"   Response length: {len(response_update)} chars")
+                print(f"   Preview: {response_update[:300]}...")
+                
+                # Check if update was successful
+                if "successfully updated" in response_update.lower() or "555-TEST-123" in response_update:
+                    print("\n   ✅ Update successful - new phone number appears in response")
+                else:
+                    print("\n   ⚠️  WARNING: Update may have failed - check response")
+            
+            print("\n✅ Customer update test: PASSED")
+                
+        except Exception as e:
+            print(f"\n❌ Customer update test: FAILED - {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print("\n" + "=" * 50)
+        print("Customer update test complete!")
     
     else:
         # Interactive mode - chat with the bot
@@ -656,28 +849,84 @@ if __name__ == "__main__":
                 
                 # Process the message - checkpointer automatically maintains conversation history
                 graph_input = {"messages": [HumanMessage(content=user_input)]}
-                config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
+                config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 20}
                 
-                result = graph.invoke(graph_input, config=config)
+                # Stream events to detect interrupts
+                events = list(graph.stream(graph_input, config=config, stream_mode="values"))
                 
-                # Get the bot's response
-                if result["messages"]:
-                    last_msg = result["messages"][-1]
-                    bot_name = getattr(last_msg, 'name', None)
-                    if bot_name == "general":
-                        bot_label = "General Bot"
-                    elif bot_name == "music":
-                        bot_label = "Music Bot"
-                    elif bot_name == "customer":
-                        bot_label = "Customer Bot"
-                    else:
-                        bot_label = "Bot"
-                    if hasattr(last_msg, 'content') and last_msg.content:
-                        print(f"\n🤖 {bot_label}: {last_msg.content}")
-                    else:
-                        print(f"\n🤖 {bot_label}: [Processing your request...]")
+                # Check if execution was interrupted (waiting for approval)
+                snapshot = graph.get_state(config)
+                if snapshot.next:
+                    # Graph is interrupted - waiting for human approval
+                    print("\n" + "="*20)
+                    print("⚠️  HUMAN APPROVAL REQUIRED ⚠️")
+                    print("="*20)
+                    print(f"\nNext node to execute: {snapshot.next}")
+                    
+                    # Show what operation is being requested from the last state
+                    if events and events[-1].get('messages'):
+                        messages = events[-1]['messages']
+                        # Find the tool call that needs approval
+                        for msg in reversed(messages):
+                            if isinstance(msg, AIMessage) and _is_tool_call(msg):
+                                tool_calls = msg.additional_kwargs.get('tool_calls', [])
+                                if tool_calls:
+                                    import json
+                                    tool_call = tool_calls[0]
+                                    tool_name = tool_call['function']['name']
+                                    tool_args = json.loads(tool_call['function']['arguments'])
+                                    print(f"\n📋 Requested Operation:")
+                                    print(f"   Tool: {tool_name}")
+                                    print(f"   Arguments:")
+                                    for key, value in tool_args.items():
+                                        print(f"      {key}: {value}")
+                                break
+                    
+                    # Get approval from user
+                    while True:
+                        approval = input("\n👤 Type 'approve' to proceed or 'reject' to cancel: ").strip().lower()
+                        
+                        if approval == 'approve':
+                            print("\n✅ Operation approved. Executing...")
+                            # Continue execution - pass None to resume from checkpoint
+                            result_events = list(graph.stream(None, config=config, stream_mode="values"))
+                            if result_events and result_events[-1].get('messages'):
+                                last_msg = result_events[-1]['messages'][-1]
+                                if hasattr(last_msg, 'content') and last_msg.content:
+                                    bot_name = getattr(last_msg, 'name', 'Bot')
+                                    print(f"\n🤖 {bot_name.title()}: {last_msg.content}")
+                            break
+                        elif approval == 'reject':
+                            print("\n❌ Operation rejected. Cancelling...")
+                            # Update state to add rejection message and set next to None to end
+                            graph.update_state(
+                                config, 
+                                {"messages": [AIMessage(content="The update operation was rejected by the administrator.", name="customer")]},
+                                as_node="customer"
+                            )
+                            print("\n🤖 Customer Bot: The update operation was rejected by the administrator.")
+                            break
+                        else:
+                            print("⚠️  Invalid input. Please type 'approve' or 'reject'.")
                 else:
-                    print("\n🤖 Bot: I'm not sure how to help with that. Try asking about music or your account!")
+                    # Normal completion - show the response
+                    if events and events[-1].get('messages'):
+                        last_msg = events[-1]['messages'][-1]
+                        bot_name = getattr(last_msg, 'name', None)
+                        if bot_name == "general":
+                            bot_label = "General Bot"
+                        elif bot_name == "music":
+                            bot_label = "Music Bot"
+                        elif bot_name == "customer":
+                            bot_label = "Customer Bot"
+                        else:
+                            bot_label = "Bot"
+                        if hasattr(last_msg, 'content') and last_msg.content:
+                            print(f"\n🤖 {bot_label}: {last_msg.content}")
+                        else:
+                            print(f"\n🤖 {bot_label}: [Processing your request...]")
+                    else:
+                        print("\n🤖 Bot: I'm not sure how to help with that. Try asking about music or your account!")
                     
             except KeyboardInterrupt:
                 print("\n\n👋 Goodbye! Thanks for using SQL Support Bot!")
