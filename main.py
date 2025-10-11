@@ -11,7 +11,8 @@ import json
 from functools import partial
 from typing import Dict, Any, List, TypedDict, Annotated
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph, START, END, add_messages
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
@@ -20,8 +21,8 @@ from langchain_community.utilities.sql_database import SQLDatabase
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 from pydantic import BaseModel, Field
-
-
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
@@ -227,15 +228,17 @@ When routing to specialists, include relevant context from the conversation:
 IMPORTANT: Use Router tool when you need specialist help, respond directly when you can answer from conversation history.
 
 When tools have been called and you receive tool responses, you must:
-1) If the tool output answers the user's request, reply to the user in clear natural language using the tool results. Do not route again.
+1) If the tool output answers the user's request, reply to the user in clear natural language using the tool results. Do NOT route again - you have the answer.
 2) If the tool output is insufficient to answer the user, ask a concise follow-up question for the exact missing information needed. Only route again if a different specialist is required.
+
+CRITICAL: If you see "Tool results summary" in your context, you already have tool results and should respond directly to the user. Do NOT route to specialists again.
 
 Routing rules:
 - Base your routing decision on the latest user message. Only if the latest message is ambiguous, ask a follow-up question. Do not consider older messages for routing.
 - Emit EXACTLY ONE call to the Router tool (choose one of: music OR customer). Never call both.
 - Do not route if you can answer directly from history.
 
-When routing to a specialist, include a one-sentence Handoff summary in your assistant message content and avoid including raw history. Include only: intent, customer_id/email (if any), relevant entities (artist/album/playlist), and the latest user utterance verbatim."""
+When routing to a specialist, include the user's exact request in your assistant message content so the specialist knows what to help with. Format: "User request: [exact user message]"""
 
 # Chains
 def get_customer_messages(messages):
@@ -287,18 +290,35 @@ def _route(state):
                 tool_call = tool_calls[0]
             else:
                 tool_call = tool_calls[0]
-            return json.loads(tool_call['function']['arguments'])['choice']
+            choice = json.loads(tool_call['function']['arguments'])['choice']
+            return choice
+        elif last_message.name == "music":
+            # Music agent made tool calls - route to music_tools
+            return "music_tools"
+        elif last_message.name == "customer":
+            # Customer agent made tool calls - route to customer_tools
+            return "customer_tools"
         else:
-            # Music or customer agent made tool calls
-            return "tools"
+            # Unknown agent with tool calls
+            return "general"
     
     # If last message is a tool response, always route back to general
     if isinstance(last_message, ToolMessage):
         return "general"
     
-    # If last message is an AI message without tool calls, wait for user input
+    # If last message is an AI message without tool calls, decide routing based on agent
     if isinstance(last_message, AIMessage) and not _is_tool_call(last_message):
-        return END  # End this turn, wait for next user input
+        if last_message.name == "general":
+            return END  # General can end the turn
+        elif last_message.name in ["music", "customer"]:
+            # Specialist agents without tool calls have responded with text
+            # This means they're either asking for more info or can't help
+            # Either way, go back to general to handle the next user input
+            content = last_message.content.lower() if last_message.content else ""
+            if any(phrase in content for phrase in ["i don't know", "i can't help", "i can't find", "not sure", "unable to"]):
+                return "general"  # Go back to general if they can't answer
+            else:
+                return "general"  # Go back to general to wait for user's next input
     
     # Default fallback
     return "general"
@@ -327,8 +347,11 @@ def _filter_incomplete_tool_calls(messages):
     return messages
 
 # Node definitions
-tools = [get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_customer_info, get_songs_in_playlist]
-tools_node = ToolNode(tools)
+music_tools = [get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_songs_in_playlist]
+customer_tools = [get_customer_info]
+
+music_tools_node = ToolNode(music_tools)
+customer_tools_node = ToolNode(customer_tools)
 
 def general_node(state):
     messages = state["messages"]
@@ -455,17 +478,17 @@ def create_graph():
     workflow.add_node("general", general_node)
     workflow.add_node("music", music_node)
     workflow.add_node("customer", customer_node)
-    workflow.add_node("tools", tools_node)
+    workflow.add_node("music_tools", music_tools_node)
+    workflow.add_node("customer_tools", customer_tools_node)
     
     # Add edges with proper routing restrictions
     workflow.add_edge(START, "general") #always start with general
-    workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", "tools": "tools", "general": "general", END: END})
-    workflow.add_conditional_edges("tools", _route, {"general": "general", "music": "music", "customer": "customer", END: END})  # Tools can go back to any agent
-    workflow.add_conditional_edges("music", _route, {"tools": "tools", "music": "music", END: END})  # Music can go to tools or continue
-    workflow.add_conditional_edges("customer", _route, {"tools": "tools", "customer": "customer", END: END})  # Customer can go to tools or continue
-    
-    # Set entry point
-    workflow.set_conditional_entry_point(_route, {"music": "music", "customer": "customer", "general": "general", "tools": "tools", END: END})
+    workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", "general": "general", END: END})
+    # Subagents and tools should always return control to general
+    workflow.add_conditional_edges("music", _route, {"music_tools": "music_tools", "music": "music", "general": "general"})  # Music can go to music tools, continue, or back to general
+    workflow.add_conditional_edges("customer", _route, {"customer_tools": "customer_tools", "customer": "customer", "general": "general"})  # Customer can go to customer tools, continue, or back to general
+    workflow.add_conditional_edges("music_tools", _route, {"music": "music", "general": "general"})  # Music tools can go to music or general
+    workflow.add_conditional_edges("customer_tools", _route, {"customer": "customer", "general": "general"})  # Customer tools can go to customer or general
     
     # Compile with checkpointer for thread-level persistence
     return workflow.compile(checkpointer=memory)
@@ -486,36 +509,82 @@ if __name__ == "__main__":
         # Test customer follow-up scenario
         from langchain_core.messages import HumanMessage
         
+        # Recreate graph to ensure latest workflow changes are used
+        graph = create_graph()
+        
         print("🧪 Testing Customer Follow-up Context")
         print("=" * 50)
         
         # Test: Account question followed by providing ID
         print("\n🧪 Testing: Account Question → Providing ID")
-        test_input = {"messages": [
-            HumanMessage(content="What's my account information?"),
-            HumanMessage(content="My customer ID is 1")
-        ]}
         config = {"configurable": {"thread_id": "test-customer-followup"}, "recursion_limit": 25}
         
         try:
-            result = graph.invoke(test_input, config=config)
-            print("✅ Customer follow-up: PASSED")
-            print(f"   📊 Total messages: {len(result['messages'])}")
+            # Step 1: Ask about account information
+            print("\n📨 Step 1: User asks about account information")
+            test_input_1 = {"messages": [HumanMessage(content="What's my account information?")]}
+            result_1 = graph.invoke(test_input_1, config=config)
+            print(f"   Response messages: {len(result_1['messages'])}")
             
-            # Show the conversation flow
-            for i, msg in enumerate(result['messages']):
-                if hasattr(msg, 'name') and msg.name:
-                    print(f"   {i+1}. {msg.name}: {type(msg).__name__}")
+            # Show step 1 messages
+            for i, msg in enumerate(result_1['messages']):
+                msg_type = type(msg).__name__
+                msg_name = getattr(msg, 'name', 'no_name')
+                msg_content = ""
+                if hasattr(msg, 'content') and msg.content:
+                    msg_content = msg.content[:80] if isinstance(msg.content, str) else str(msg.content)[:80]
+                
+                # Check for tool calls
+                if hasattr(msg, 'additional_kwargs') and 'tool_calls' in msg.additional_kwargs:
+                    tool_calls = msg.additional_kwargs['tool_calls']
+                    print(f"   {i+1}. {msg_name}: {msg_type} (has {len(tool_calls)} tool calls)")
+                    for tc in tool_calls:
+                        print(f"       └─ Tool: {tc['function']['name']} | Args: {tc['function']['arguments'][:50]}...")
+                elif hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    print(f"   {i+1}. {msg_name}: {msg_type} (has {len(msg.tool_calls)} tool calls)")
                 else:
-                    print(f"   {i+1}. {type(msg).__name__}")
+                    print(f"   {i+1}. {msg_name}: {msg_type}")
+                    if msg_content:
+                        print(f"       └─ {msg_content}...")
             
-            # Check if we got a final response
-            last_msg = result['messages'][-1]
+            # Step 2: Provide customer ID
+            print("\n📨 Step 2: User provides customer ID")
+            test_input_2 = {"messages": [HumanMessage(content="My customer ID is 1")]}
+            result_2 = graph.invoke(test_input_2, config=config)
+            print(f"   Response messages: {len(result_2['messages'])}")
+            
+            # Show step 2 messages
+            for i, msg in enumerate(result_2['messages']):
+                msg_type = type(msg).__name__
+                msg_name = getattr(msg, 'name', 'no_name')
+                msg_content = ""
+                if hasattr(msg, 'content') and msg.content:
+                    msg_content = msg.content[:80] if isinstance(msg.content, str) else str(msg.content)[:80]
+                
+                # Check for tool calls
+                if hasattr(msg, 'additional_kwargs') and 'tool_calls' in msg.additional_kwargs:
+                    tool_calls = msg.additional_kwargs['tool_calls']
+                    print(f"   {i+1}. {msg_name}: {msg_type} (has {len(tool_calls)} tool calls)")
+                    for tc in tool_calls:
+                        print(f"       └─ Tool: {tc['function']['name']} | Args: {tc['function']['arguments'][:50]}...")
+                elif hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    print(f"   {i+1}. {msg_name}: {msg_type} (has {len(msg.tool_calls)} tool calls)")
+                else:
+                    print(f"   {i+1}. {msg_name}: {msg_type}")
+                    if msg_content:
+                        print(f"       └─ {msg_content}...")
+            
+            # Check final response
+            last_msg = result_2['messages'][-1]
             if hasattr(last_msg, 'content') and last_msg.content:
-                print(f"   📝 Final response: {last_msg.content[:150]}...")
+                print(f"\n   📝 Final response: {last_msg.content[:150]}...")
+            
+            print("\n✅ Customer follow-up: PASSED")
                 
         except Exception as e:
-            print(f"❌ Customer follow-up: FAILED - {e}")
+            print(f"\n❌ Customer follow-up: FAILED - {e}")
+            import traceback
+            traceback.print_exc()
         
         print("\n" + "=" * 50)
         print("Customer follow-up test complete!")
@@ -530,12 +599,9 @@ if __name__ == "__main__":
         print("Type 'quit' or 'exit' to stop.")
         print("=" * 50)
         
-        # Get user ID for conversation thread
-        user_id = input("\n👤 Please enter your user ID: ").strip()
-        if not user_id:
-            user_id = "anonymous-user"
-        
-        thread_id = f"user-{user_id}"
+        # Create a thread for tracking the state of our run
+        import uuid
+        thread_id = f"session-{uuid.uuid4().hex[:8]}"
         print(f"📝 Starting conversation thread: {thread_id}")
         
         while True:
