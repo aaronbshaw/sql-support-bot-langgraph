@@ -57,7 +57,6 @@ engine = get_engine_for_chinook_db()
 db = SQLDatabase(engine)
 
 # Define the memory (short-term memory with thread-level persistence)
-from langgraph.checkpoint.memory import MemorySaver
 memory = MemorySaver()
 
 # Define the state schema for StateGraph
@@ -284,6 +283,29 @@ def _route(state):
     if isinstance(last_message, AIMessage) and _is_tool_call(last_message):
         if last_message.name == "general":
             # General agent made a routing decision
+            # Check if we just came from a specialist agent WITHOUT new user input
+            # If so, don't route to specialists again - END instead to avoid loops
+            if len(messages) >= 2:
+                prev_msg = messages[-2]
+                # Check if previous message is from specialist and there's no HumanMessage after it
+                if isinstance(prev_msg, AIMessage) and hasattr(prev_msg, 'name') and prev_msg.name in ["music", "customer"]:
+                    # Find if there's a HumanMessage between the specialist response and now
+                    # Look back through recent messages to see if there's new user input
+                    has_new_user_input = False
+                    for i in range(len(messages) - 1, max(0, len(messages) - 5), -1):
+                        if isinstance(messages[i], HumanMessage):
+                            # Found a human message - check if it's after the specialist response
+                            specialist_idx = messages.index(prev_msg) if prev_msg in messages else -1
+                            human_idx = i
+                            if human_idx > specialist_idx:
+                                has_new_user_input = True
+                                break
+                            break
+                    
+                    # If no new user input since specialist responded, END to avoid loop
+                    if not has_new_user_input:
+                        return END
+            
             tool_calls = last_message.additional_kwargs['tool_calls']
             if len(tool_calls) > 1:
                 # If multiple tool calls, just take the first one
@@ -302,8 +324,19 @@ def _route(state):
             # Unknown agent with tool calls
             return "general"
     
-    # If last message is a tool response, always route back to general
+    # If last message is a tool response, route back to the agent that called it
     if isinstance(last_message, ToolMessage):
+        # Look back to find which agent made the tool call
+        for i in range(len(messages) - 2, -1, -1):
+            msg = messages[i]
+            if isinstance(msg, AIMessage) and _is_tool_call(msg):
+                agent_name = getattr(msg, 'name', None)
+                if agent_name == "music":
+                    return "music"
+                elif agent_name == "customer":
+                    return "customer"
+                break
+        # Default to general if we can't determine the calling agent
         return "general"
     
     # If last message is an AI message without tool calls, decide routing based on agent
@@ -313,12 +346,8 @@ def _route(state):
         elif last_message.name in ["music", "customer"]:
             # Specialist agents without tool calls have responded with text
             # This means they're either asking for more info or can't help
-            # Either way, go back to general to handle the next user input
-            content = last_message.content.lower() if last_message.content else ""
-            if any(phrase in content for phrase in ["i don't know", "i can't help", "i can't find", "not sure", "unable to"]):
-                return "general"  # Go back to general if they can't answer
-            else:
-                return "general"  # Go back to general to wait for user's next input
+            # END the turn so user can respond
+            return END
     
     # Default fallback
     return "general"
@@ -372,33 +401,15 @@ def general_node(state):
     # Build context
     conversation_context = [SystemMessage(content=system_message)]
     
-    # Heuristic: if the latest user message looks like a memory/history question,
-    # include a small recent window of messages; otherwise only include the latest user message.
-    def _looks_like_memory_question(text: str) -> bool:
-        text_l = text.lower()
-        keywords = [
-            "what was the last", "what did we talk about", "what did i ask",
-            "remind me", "previous", "earlier", "before", "who was the last",
-        ]
-        return any(k in text_l for k in keywords)
-
-    if human_messages:
-        latest_human = human_messages[-1]
-        if isinstance(latest_human, HumanMessage) and _looks_like_memory_question(latest_human.content or ""):
-            # Include small recent window: last 3 human + last 3 safe AI
-            recent_humans = human_messages[-3:] if len(human_messages) > 3 else human_messages
-            for hm in recent_humans:
-                conversation_context.append(hm)
-            recent_safe_ai = safe_ai_messages[-3:] if len(safe_ai_messages) > 3 else safe_ai_messages
-            for am in recent_safe_ai:
-                conversation_context.append(am)
-        else:
-            # Default: only the latest user message to drive routing
-            conversation_context.append(latest_human)
+    # Include recent conversation history for better context awareness
+    # Include last 3 human messages and last 5 safe AI messages (from any agent)
+    recent_humans = human_messages[-3:] if len(human_messages) > 3 else human_messages
+    for hm in recent_humans:
+        conversation_context.append(hm)
     
-    # Add recent safe AI responses for context (last 5)
     recent_safe_ai = safe_ai_messages[-5:] if len(safe_ai_messages) > 5 else safe_ai_messages
-    conversation_context.extend(recent_safe_ai)
+    for am in recent_safe_ai:
+        conversation_context.append(am)
     
     # Summarize recent tool outputs for safe inclusion
     if tool_messages:
@@ -421,16 +432,28 @@ def general_node(state):
 def music_node(state):
     messages = state["messages"]
     
-    # For music agent, only pass the current request - no history to avoid recursion
-    # Just get the most recent human message
+    # Extract message types
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
     
-    # Build context: just the current request
+    # Build context with conversation history
     conversation_context = [SystemMessage(content=song_system_message)]
     
-    # Only add the most recent human message (current request)
-    if human_messages:
-        conversation_context.append(human_messages[-1])
+    # Include recent human messages (last 3) for context
+    recent_humans = human_messages[-3:] if len(human_messages) > 3 else human_messages
+    for hm in recent_humans:
+        conversation_context.append(hm)
+    
+    # Include tool results if available (for formulating responses with data)
+    if tool_messages:
+        recent_tools = tool_messages[-3:] if len(tool_messages) > 3 else tool_messages
+        for tm in recent_tools:
+            # Add tool results as system messages for context
+            content = tm.content if hasattr(tm, 'content') and isinstance(tm.content, str) else str(tm.content)
+            if len(content) > 1000:
+                content = content[:1000] + "..."
+            tool_name = getattr(tm, "name", "tool")
+            conversation_context.append(SystemMessage(content=f"Tool result from {tool_name}: {content}"))
     
     result = song_recc_chain.invoke(conversation_context)
     return {"messages": [add_name(result, name="music")]}
@@ -442,6 +465,7 @@ def customer_node(state):
     # Include recent human messages and safe AI responses (no tool calls)
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
     ai_messages = [m for m in messages if isinstance(m, AIMessage)]
+    tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
     
     # Filter out AI messages with tool calls to avoid OpenAI errors
     safe_ai_messages = []
@@ -459,6 +483,17 @@ def customer_node(state):
     # Add any recent safe AI messages for context (last 2)
     recent_safe_ai = safe_ai_messages[-2:] if len(safe_ai_messages) > 2 else safe_ai_messages
     conversation_context.extend(recent_safe_ai)
+    
+    # Include tool results if available (for formulating responses with data)
+    if tool_messages:
+        recent_tools = tool_messages[-3:] if len(tool_messages) > 3 else tool_messages
+        for tm in recent_tools:
+            # Add tool results as system messages for context
+            content = tm.content if hasattr(tm, 'content') and isinstance(tm.content, str) else str(tm.content)
+            if len(content) > 1000:
+                content = content[:1000] + "..."
+            tool_name = getattr(tm, "name", "tool")
+            conversation_context.append(SystemMessage(content=f"Tool result from {tool_name}: {content}"))
     
     result = customer_chain.invoke(conversation_context)
     return {"messages": [add_name(result, name="customer")]}
@@ -484,11 +519,12 @@ def create_graph():
     # Add edges with proper routing restrictions
     workflow.add_edge(START, "general") #always start with general
     workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", "general": "general", END: END})
-    # Subagents and tools should always return control to general
-    workflow.add_conditional_edges("music", _route, {"music_tools": "music_tools", "music": "music", "general": "general"})  # Music can go to music tools, continue, or back to general
-    workflow.add_conditional_edges("customer", _route, {"customer_tools": "customer_tools", "customer": "customer", "general": "general"})  # Customer can go to customer tools, continue, or back to general
-    workflow.add_conditional_edges("music_tools", _route, {"music": "music", "general": "general"})  # Music tools can go to music or general
-    workflow.add_conditional_edges("customer_tools", _route, {"customer": "customer", "general": "general"})  # Customer tools can go to customer or general
+    # Specialist agents can route to their tools, back to themselves, to general, or END
+    workflow.add_conditional_edges("music", _route, {"music_tools": "music_tools", "music": "music", "general": "general", END: END})
+    workflow.add_conditional_edges("customer", _route, {"customer_tools": "customer_tools", "customer": "customer", "general": "general", END: END})
+    # Tools route back to their specialist agent or to general
+    workflow.add_conditional_edges("music_tools", _route, {"music": "music", "general": "general"})
+    workflow.add_conditional_edges("customer_tools", _route, {"customer": "customer", "general": "general"})
     
     # Compile with checkpointer for thread-level persistence
     return workflow.compile(checkpointer=memory)
