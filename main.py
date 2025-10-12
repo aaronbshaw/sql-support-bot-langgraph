@@ -252,7 +252,7 @@ IMPORTANT GUIDELINES:
 
 If you are unable to help the user, politely explain what information you need and suggest they contact support if needed."""
 
-song_system_message = """Your job is to help a customer find any songs they are looking for. 
+song_system_message = """Your job is to help a customer find information about music they are looking for. 
 
 IMPORTANT: Always review the conversation history to understand what the customer has asked about previously. You can reference previous artists, songs, or topics they mentioned.
 
@@ -347,18 +347,16 @@ def should_summarize(state):
     """
     messages = state["messages"]
     
-    # Get meaningful messages (human + AI responses, exclude tool messages, routing, and summaries)
-    human_messages = [m for m in messages if isinstance(m, HumanMessage)]
-    ai_messages = [m for m in messages if isinstance(m, AIMessage)]
-    
-    # Filter out AI messages with tool calls (routing artifacts)
-    safe_ai_messages = []
-    for ai_msg in ai_messages:
-        if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
-            if not (hasattr(ai_msg, 'additional_kwargs') and 'tool_calls' in ai_msg.additional_kwargs):
-                safe_ai_messages.append(ai_msg)
-    
-    meaningful_messages = human_messages + safe_ai_messages
+    # Get meaningful messages in chronological order (same logic as summarize_conversation)
+    meaningful_messages = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            meaningful_messages.append(msg)
+        elif isinstance(msg, AIMessage):
+            # Exclude AI messages with tool calls (routing artifacts)
+            if not (hasattr(msg, 'tool_calls') and msg.tool_calls):
+                if not (hasattr(msg, 'additional_kwargs') and 'tool_calls' in msg.additional_kwargs):
+                    meaningful_messages.append(msg)
     
     # Summarize whenever we have more than 6 meaningful messages
     # This creates a rolling/progressive summary that updates continuously
@@ -507,21 +505,21 @@ def summarize_conversation(state):
             existing_summary = msg
             break
     
-    # Get meaningful messages (human + AI responses, exclude tool messages and routing)
-    human_messages = [m for m in messages if isinstance(m, HumanMessage)]
-    ai_messages = [m for m in messages if isinstance(m, AIMessage)]
+    # Get meaningful messages (human + AI responses) in CHRONOLOGICAL ORDER
+    # IMPORTANT: Preserve original order so last 6 includes a balanced mix
+    meaningful_messages = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            meaningful_messages.append(msg)
+        elif isinstance(msg, AIMessage):
+            # Exclude AI messages with tool calls (routing artifacts)
+            if not (hasattr(msg, 'tool_calls') and msg.tool_calls):
+                if not (hasattr(msg, 'additional_kwargs') and 'tool_calls' in msg.additional_kwargs):
+                    meaningful_messages.append(msg)
     
-    # Filter out AI messages with tool calls (routing artifacts)
-    safe_ai_messages = []
-    for ai_msg in ai_messages:
-        if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
-            if not (hasattr(ai_msg, 'additional_kwargs') and 'tool_calls' in ai_msg.additional_kwargs):
-                safe_ai_messages.append(ai_msg)
-    
-    meaningful_messages = human_messages + safe_ai_messages
-    
-    # Keep the last 4 meaningful messages, summarize/extend with the rest
-    messages_to_keep = meaningful_messages[-4:]
+    # Keep the last 6 meaningful messages, summarize/extend with the rest
+    # By preserving chronological order, we get a balanced mix (e.g., H, A, H, A, H, A)
+    messages_to_keep = meaningful_messages[-6:]
     messages_to_summarize = [m for m in meaningful_messages if m not in messages_to_keep]
     
     if not messages_to_summarize:
@@ -606,13 +604,16 @@ Comprehensive Summary:"""
     # Create the summary message with clear formatting
     summary_message = SystemMessage(
         content=f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CONVERSATION HISTORY SUMMARY
+CONVERSATION HISTORY SUMMARY (For Background Context)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 {summary_response.content}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-(This is a summary of previous conversation. Recent messages follow below.)
+NOTE: The summary above is HISTORICAL CONTEXT ONLY.
+Recent conversation messages follow below in chronological order.
+The LAST user message in the conversation is the CURRENT REQUEST to respond to.
+Earlier messages provide context but should NOT influence routing decisions.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""",
         name="conversation_summary"
     )
@@ -655,22 +656,26 @@ def general_node(state):
     if existing_summary:
         conversation_context.append(existing_summary)
     
-    # Include conversation history (summarize node already trimmed if needed)
-    # Add all except the LAST human message (we'll add that specially)
-    for hm in human_messages[:-1]:
-        conversation_context.append(hm)
+    # Include messages in CHRONOLOGICAL ORDER (as they appear in state)
+    # This preserves conversation flow: H1→A1→H2→A2→H3→A3
+    for msg in messages:
+        # Skip summary messages (already added above)
+        if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
+            continue
+        # Add human messages
+        elif isinstance(msg, HumanMessage):
+            conversation_context.append(msg)
+        # Add AI messages (but not routing/tool calls)
+        elif isinstance(msg, AIMessage):
+            if not (hasattr(msg, 'tool_calls') and msg.tool_calls):
+                if not (hasattr(msg, 'additional_kwargs') and 'tool_calls' in msg.additional_kwargs):
+                    conversation_context.append(msg)
     
-    for am in safe_ai_messages:
-        conversation_context.append(am)
-    
-    # Add CURRENT user request with emphasis if we have a summary
-    # This ensures routing is based on the latest request, not the summary
+    # Add clear instruction about which message to respond to
     if human_messages:
-        if existing_summary:
-            conversation_context.append(
-                SystemMessage(content=f"⚠️ CURRENT USER REQUEST (base your routing on THIS message, not the summary above):")
-            )
-        conversation_context.append(human_messages[-1])
+        conversation_context.append(
+            SystemMessage(content=f"⚠️ ROUTING INSTRUCTION: The LAST user message above is the CURRENT request. Route based on THAT message. Earlier messages are for context only.")
+        )
     
     # Summarize recent tool outputs for safe inclusion
     if tool_messages:
@@ -699,10 +704,22 @@ def music_node(state):
     # Build context (don't add system message here - the chain will add it)
     conversation_context = []
     
-    # Only include the MOST RECENT human message (current request)
-    # Including multiple human messages confuses the LLM about which request to answer
-    if human_messages:
-        conversation_context.append(human_messages[-1])
+    # Check if there's a conversation summary (for context like "these artists")
+    existing_summary = None
+    for msg in messages:
+        if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
+            existing_summary = msg
+            break
+    
+    # If there's a summary, include it so agent can reference previous context
+    if existing_summary:
+        conversation_context.append(existing_summary)
+    
+    # Include recent human messages (last 3) for references like "these artists"
+    # This allows the agent to understand pronouns and references
+    recent_humans = human_messages[-3:] if len(human_messages) > 3 else human_messages
+    for hm in recent_humans:
+        conversation_context.append(hm)
     
     # Only include tool results from the CURRENT turn (after the last human message)
     # Find the index of the most recent human message
@@ -725,37 +742,17 @@ def music_node(state):
                 tool_name = getattr(tm, "name", "tool")
                 conversation_context.append(SystemMessage(content=f"Tool result from {tool_name}: {content}"))
     
+    # Add clear instruction about current vs context messages
+    if human_messages and len(human_messages) > 1:
+        conversation_context.append(
+            SystemMessage(content=f"⚠️ INSTRUCTION: The LAST user message above is the CURRENT request to answer. Earlier messages provide context (for references like 'these artists').")
+        )
+    
     result = song_recc_chain.invoke(conversation_context)
     return {"messages": [add_name(result, name="music")]}
 
 def customer_node(state):
     messages = state["messages"]
-    
-    # Check if we just executed a tool (especially update_customer_info)
-    # If so, we should respond to the user with the result, NOT call tools again
-    if messages:
-        last_msg = messages[-1]
-        if isinstance(last_msg, ToolMessage):
-            # We just came from a tool execution
-            tool_name = getattr(last_msg, 'name', '')
-            
-            # If it was an update operation, just respond - don't loop
-            if tool_name == 'update_customer_info':
-                # Tool already executed, just format a nice response
-                content = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
-                
-                # Extract success/failure info
-                if 'successfully updated' in content.lower():
-                    response_msg = AIMessage(
-                        content=f"Your information has been successfully updated! {content[:200]}",
-                        name="customer"
-                    )
-                else:
-                    response_msg = AIMessage(
-                        content=f"There was an issue with the update: {content[:200]}",
-                        name="customer"
-                    )
-                return {"messages": [response_msg]}
     
     # For customer agent, pass recent conversation context for better responses
     # Include recent human messages and safe AI responses (no tool calls)
@@ -781,14 +778,19 @@ def customer_node(state):
     if existing_summary:
         conversation_context.append(existing_summary)
     
-    # Include recent human messages (increased to 5 for better memory)
-    # This helps maintain context like customer IDs across multiple turns
-    recent_human = human_messages[-5:] if len(human_messages) > 5 else human_messages
-    conversation_context.extend(recent_human)
-    
-    # Add recent safe AI messages for context (last 3)
-    recent_safe_ai = safe_ai_messages[-3:] if len(safe_ai_messages) > 3 else safe_ai_messages
-    conversation_context.extend(recent_safe_ai)
+    # Include messages in CHRONOLOGICAL ORDER to preserve conversation flow
+    for msg in messages:
+        # Skip summary (already added)
+        if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
+            continue
+        # Add human messages
+        elif isinstance(msg, HumanMessage):
+            conversation_context.append(msg)
+        # Add AI messages (exclude tool calls)
+        elif isinstance(msg, AIMessage):
+            if not (hasattr(msg, 'tool_calls') and msg.tool_calls):
+                if not (hasattr(msg, 'additional_kwargs') and 'tool_calls' in msg.additional_kwargs):
+                    conversation_context.append(msg)
     
     # Always include the most recent customer lookup for context
     # This ensures the agent remembers customer info even across multiple turns
@@ -829,6 +831,24 @@ def customer_node(state):
                     content = content[:1000] + "..."
                 tool_name = getattr(tm, "name", "tool")
                 conversation_context.append(SystemMessage(content=f"Tool result from {tool_name}: {content}"))
+    
+    # Check if we just executed update_customer_info to prevent loops
+    recent_update_tools = [
+        m for m in messages[-3:] 
+        if isinstance(m, ToolMessage) and getattr(m, 'name', '') == 'update_customer_info'
+    ]
+    
+    if recent_update_tools:
+        # We just executed an update - tell the LLM to format a response, not call update again
+        conversation_context.append(
+            SystemMessage(content=f"⚠️ IMPORTANT: An update was just completed. Format a friendly response for the user based on the tool result above. Do NOT call update_customer_info again - the update is already done.")
+        )
+    
+    # Add clear instruction about current vs context messages
+    if human_messages:
+        conversation_context.append(
+            SystemMessage(content=f"⚠️ INSTRUCTION: The LAST user message above is the CURRENT request to address. Check the conversation summary and earlier messages for customer ID/email before asking for it again.")
+        )
     
     result = customer_chain.invoke(conversation_context)
     return {"messages": [add_name(result, name="customer")]}
