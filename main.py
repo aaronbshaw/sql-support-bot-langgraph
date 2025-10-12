@@ -223,7 +223,12 @@ class Router(BaseModel):
 # Prompts
 customer_prompt = """Your job is to help a user with their account information.
 
-IMPORTANT: Always review the conversation history to understand what the customer has asked about previously. You can reference previous topics, questions, or information they mentioned.
+IMPORTANT: Always review the conversation history AND conversation summary (if present) to understand what the customer has asked about previously. You can reference previous topics, questions, or information they mentioned.
+
+**CRITICAL: Check the conversation summary for customer ID or email address BEFORE asking the user for it again.**
+- If the summary contains "Customer ID: [number]" or "ID: [number]", use that ID
+- If the summary contains an email address, use that email
+- Only ask for ID/email if it's NOT in the summary or previous messages
 
 You have access to two customer tools:
 
@@ -237,12 +242,13 @@ You have access to two customer tools:
    - Example: update_customer_info("1", "Phone", "+1 555-0123")
 
 IMPORTANT GUIDELINES:
-1. Ask the user for their customer ID or email address before looking up their information
-2. If the user doesn't know their customer ID, ask for their email address instead
-3. Before updating, verify the customer ID and confirm what field they want to update
-4. After updating, show the user their updated information
-5. If there's an error or no customer found, explain the issue clearly
-6. Email addresses must be exact matches - partial matches will not work
+1. **First, check conversation summary and history for customer ID or email**
+2. Only ask for customer ID/email if not already provided in summary or context
+3. If the user doesn't know their customer ID, ask for their email address instead
+4. Before updating, verify the customer ID and confirm what field they want to update
+5. After updating, show the user their updated information (do NOT call update again)
+6. If there's an error or no customer found, explain the issue clearly
+7. Email addresses must be exact matches - partial matches will not work
 
 If you are unable to help the user, politely explain what information you need and suggest they contact support if needed."""
 
@@ -514,8 +520,8 @@ def summarize_conversation(state):
     
     meaningful_messages = human_messages + safe_ai_messages
     
-    # Keep the last 3 messages, summarize/extend with the rest
-    messages_to_keep = meaningful_messages[-3:]
+    # Keep the last 4 meaningful messages, summarize/extend with the rest
+    messages_to_keep = meaningful_messages[-4:]
     messages_to_summarize = [m for m in meaningful_messages if m not in messages_to_keep]
     
     if not messages_to_summarize:
@@ -523,6 +529,9 @@ def summarize_conversation(state):
         return {"messages": []}
     
     # Build summary text for new messages
+    # Include ToolMessages in the summary text but DON'T delete them from state
+    tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+    
     summary_parts = []
     for msg in messages_to_summarize:
         if isinstance(msg, HumanMessage):
@@ -530,6 +539,14 @@ def summarize_conversation(state):
         elif isinstance(msg, AIMessage):
             content = msg.content[:200] if msg.content else "[no content]"
             summary_parts.append(f"Bot: {content}")
+    
+    # Add relevant tool results to summary (especially customer lookups)
+    for tm in tool_messages:
+        tool_name = getattr(tm, 'name', '')
+        if tool_name == 'get_customer_info':
+            # Extract customer ID from result
+            content_str = str(tm.content)
+            summary_parts.append(f"[Customer Info Retrieved]: {content_str[:150]}")
     
     new_messages_text = "\n".join(summary_parts)
     
@@ -546,7 +563,9 @@ NEW MESSAGES TO ADD TO SUMMARY:
 
 Create an UPDATED comprehensive summary that:
 - Combines information from the existing summary with the new messages
-- Maintains ALL important details (for example: customer IDs, names, songs, albums, playlists, artists discussed)
+- **CRITICAL: If a customer ID or email address was provided, ALWAYS include it in the summary**
+- Format customer info clearly: "Customer: [Name], ID: [number], Email: [email]" if available
+- Maintains ALL important details (customer IDs, names, songs, albums, playlists, artists discussed)
 - Keeps the summary current and factual
 - Does NOT lose any critical information from either the old summary or new messages
 
@@ -555,7 +574,8 @@ Updated Summary:"""
         # Get updated summary
         summary_response = model.invoke([SystemMessage(content=summary_prompt)])
         
-        # We'll delete the old summary and add the new one
+        # Delete the old summary and old human/AI messages
+        # IMPORTANT: Do NOT delete ToolMessages - they contain critical data (customer lookups, etc.)
         delete_messages = [RemoveMessage(id=existing_summary.id)] + [RemoveMessage(id=m.id) for m in messages_to_summarize]
     else:
         # CREATE first summary
@@ -563,6 +583,8 @@ Updated Summary:"""
 
 Create a comprehensive summary (4-6 sentences) covering:
 - ALL topics discussed (music queries, customer account questions, etc.)
+- **CRITICAL: If a customer ID or email address was provided, ALWAYS include it at the START of the summary**
+- Format customer info clearly: "Customer: [Name], ID: [number], Email: [email]" if available
 - ALL important information provided (customer IDs, email addresses, artist names, album requests)
 - Specific data retrieved (customer names, song lists, etc.)
 - Any pending actions or unresolved requests
@@ -578,7 +600,7 @@ Comprehensive Summary:"""
         # Get summary from model
         summary_response = model.invoke([SystemMessage(content=summary_prompt)])
         
-        # Delete old messages
+        # Delete old human/AI messages only (NOT ToolMessages - they're preserved)
         delete_messages = [RemoveMessage(id=m.id) for m in messages_to_summarize]
     
     # Create the summary message with clear formatting
@@ -709,6 +731,32 @@ def music_node(state):
 def customer_node(state):
     messages = state["messages"]
     
+    # Check if we just executed a tool (especially update_customer_info)
+    # If so, we should respond to the user with the result, NOT call tools again
+    if messages:
+        last_msg = messages[-1]
+        if isinstance(last_msg, ToolMessage):
+            # We just came from a tool execution
+            tool_name = getattr(last_msg, 'name', '')
+            
+            # If it was an update operation, just respond - don't loop
+            if tool_name == 'update_customer_info':
+                # Tool already executed, just format a nice response
+                content = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
+                
+                # Extract success/failure info
+                if 'successfully updated' in content.lower():
+                    response_msg = AIMessage(
+                        content=f"Your information has been successfully updated! {content[:200]}",
+                        name="customer"
+                    )
+                else:
+                    response_msg = AIMessage(
+                        content=f"There was an issue with the update: {content[:200]}",
+                        name="customer"
+                    )
+                return {"messages": [response_msg]}
+    
     # For customer agent, pass recent conversation context for better responses
     # Include recent human messages and safe AI responses (no tool calls)
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
@@ -722,6 +770,16 @@ def customer_node(state):
     
     # Build context (don't add system message here - the chain will add it)
     conversation_context = []
+    
+    # Check if there's a conversation summary and include it first
+    existing_summary = None
+    for msg in messages:
+        if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
+            existing_summary = msg
+            break
+    
+    if existing_summary:
+        conversation_context.append(existing_summary)
     
     # Include recent human messages (increased to 5 for better memory)
     # This helps maintain context like customer IDs across multiple turns
