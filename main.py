@@ -473,20 +473,73 @@ def general_node(state):
         if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
             safe_ai_messages.append(ai_msg)
     
+    # Check if we need to summarize (conversation getting long)
+    # Count meaningful messages (human + safe AI, not tool messages or routing)
+    meaningful_messages = human_messages + safe_ai_messages
+    
     # Build context
     conversation_context = [SystemMessage(content=system_message)]
     
-    # Include recent conversation history for better context awareness
-    # Include last 3 human messages and last 5 safe AI messages (from any agent)
-    recent_humans = human_messages[-3:] if len(human_messages) > 3 else human_messages
-    for hm in recent_humans:
-        conversation_context.append(hm)
+    # Check if we have an existing conversation summary
+    existing_summary = None
+    for msg in messages:
+        if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
+            existing_summary = msg
+            break
     
-    recent_safe_ai = safe_ai_messages[-5:] if len(safe_ai_messages) > 5 else safe_ai_messages
-    for am in recent_safe_ai:
-        conversation_context.append(am)
+    if len(meaningful_messages) > 10:
+        # Long conversation - use summarization
+        if existing_summary:
+            # Use existing summary
+            conversation_context.append(existing_summary)
+        else:
+            # Create a new summary of older messages
+            # Keep last 4 messages, summarize the rest
+            messages_to_summarize = meaningful_messages[:-4]
+            
+            # Build summary prompt
+            summary_parts = []
+            for msg in messages_to_summarize:
+                if isinstance(msg, HumanMessage):
+                    summary_parts.append(f"User: {msg.content[:200]}")
+                elif isinstance(msg, AIMessage):
+                    summary_parts.append(f"Bot: {msg.content[:200]}")
+            
+            summary_text = "\n".join(summary_parts[-8:])  # Last 8 older messages to summarize
+            
+            summary_prompt = f"""Summarize this conversation between a user and a music store support bot. 
+Focus on: what the user asked about, any important IDs/info provided, and outcomes.
+Keep it concise (2-3 sentences max).
+
+Recent conversation:
+{summary_text}
+
+Summary:"""
+            
+            # Get summary from model
+            summary_response = model.invoke([SystemMessage(content=summary_prompt)])
+            summary_message = SystemMessage(
+                content=f"Previous conversation summary: {summary_response.content}",
+                name="conversation_summary"
+            )
+            conversation_context.append(summary_message)
+        
+        # Add recent messages (last 4)
+        recent_messages = meaningful_messages[-4:]
+        for msg in recent_messages:
+            conversation_context.append(msg)
+    else:
+        # Short conversation - use original approach
+        # Include recent conversation history for better context awareness
+        recent_humans = human_messages[-3:] if len(human_messages) > 3 else human_messages
+        for hm in recent_humans:
+            conversation_context.append(hm)
+        
+        recent_safe_ai = safe_ai_messages[-5:] if len(safe_ai_messages) > 5 else safe_ai_messages
+        for am in recent_safe_ai:
+            conversation_context.append(am)
     
-    # Summarize recent tool outputs for safe inclusion
+    # Summarize recent tool outputs for safe inclusion (always include these)
     if tool_messages:
         recent_tools = tool_messages[-5:] if len(tool_messages) > 5 else tool_messages
         # Create a compact summary string of tool outputs
@@ -502,7 +555,17 @@ def general_node(state):
         conversation_context.append(SystemMessage(content=f"Tool results summary (most recent first):\n{tools_summary_text}"))
     
     result = general_chain.invoke(conversation_context)
-    return {"messages": [add_name(result, name="general")]}
+    
+    # If we just created a summary, store it in state for reuse
+    response_messages = [add_name(result, name="general")]
+    if len(meaningful_messages) > 10 and not existing_summary:
+        # Add the summary to state so we don't regenerate it
+        for msg in conversation_context:
+            if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
+                response_messages.insert(0, msg)
+                break
+    
+    return {"messages": response_messages}
 
 def music_node(state):
     messages = state["messages"]
@@ -559,17 +622,32 @@ def customer_node(state):
     # Build context: recent human messages + safe AI context
     conversation_context = [SystemMessage(content=customer_prompt)]
     
-    # Include recent human messages (last 2 for context of multi-turn conversations)
-    # E.g., "What's my account?" followed by "My ID is 5"
-    recent_human = human_messages[-2:] if len(human_messages) > 2 else human_messages
+    # Include recent human messages (increased to 5 for better memory)
+    # This helps maintain context like customer IDs across multiple turns
+    recent_human = human_messages[-5:] if len(human_messages) > 5 else human_messages
     conversation_context.extend(recent_human)
     
-    # Add the most recent safe AI message for context
-    if safe_ai_messages:
-        conversation_context.append(safe_ai_messages[-1])
+    # Add recent safe AI messages for context (last 3)
+    recent_safe_ai = safe_ai_messages[-3:] if len(safe_ai_messages) > 3 else safe_ai_messages
+    conversation_context.extend(recent_safe_ai)
     
-    # Only include tool results from the CURRENT turn (after the last human message)
-    # Find the index of the most recent human message
+    # Always include the most recent customer lookup for context
+    # This ensures the agent remembers customer info even across multiple turns
+    customer_info_tools = [
+        m for m in messages 
+        if isinstance(m, ToolMessage) and getattr(m, 'name', '') == 'get_customer_info'
+    ]
+    if customer_info_tools:
+        # Include the most recent customer info lookup
+        most_recent_customer_lookup = customer_info_tools[-1]
+        content = most_recent_customer_lookup.content
+        if isinstance(content, str) and len(content) > 500:
+            content = content[:500] + "..."
+        conversation_context.append(
+            SystemMessage(content=f"Previously fetched customer info: {content}")
+        )
+    
+    # Include tool results from the CURRENT turn (after the last human message)
     if human_messages:
         last_human_idx = None
         for i in range(len(messages) - 1, -1, -1):
@@ -583,6 +661,10 @@ def customer_node(state):
             
             # Include these tool results for formulating response
             for tm in current_turn_tools:
+                # Skip if we already included this as the most recent customer lookup
+                if tm == customer_info_tools[-1] if customer_info_tools else None:
+                    continue
+                    
                 content = tm.content if hasattr(tm, 'content') and isinstance(tm.content, str) else str(tm.content)
                 if len(content) > 1000:
                     content = content[:1000] + "..."
@@ -851,8 +933,9 @@ if __name__ == "__main__":
                 graph_input = {"messages": [HumanMessage(content=user_input)]}
                 config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 20}
                 
-                # Stream events to detect interrupts
-                events = list(graph.stream(graph_input, config=config, stream_mode="values"))
+                # Use invoke() instead of stream() for interrupt to work properly
+                # invoke() will execute until an interrupt point and pause
+                result = graph.invoke(graph_input, config=config)
                 
                 # Check if execution was interrupted (waiting for approval)
                 snapshot = graph.get_state(config)
@@ -863,9 +946,9 @@ if __name__ == "__main__":
                     print("="*20)
                     print(f"\nNext node to execute: {snapshot.next}")
                     
-                    # Show what operation is being requested from the last state
-                    if events and events[-1].get('messages'):
-                        messages = events[-1]['messages']
+                    # Show what operation is being requested from the checkpoint state
+                    if snapshot.values.get('messages'):
+                        messages = snapshot.values['messages']
                         # Find the tool call that needs approval
                         for msg in reversed(messages):
                             if isinstance(msg, AIMessage) and _is_tool_call(msg):
@@ -889,9 +972,9 @@ if __name__ == "__main__":
                         if approval == 'approve':
                             print("\n✅ Operation approved. Executing...")
                             # Continue execution - pass None to resume from checkpoint
-                            result_events = list(graph.stream(None, config=config, stream_mode="values"))
-                            if result_events and result_events[-1].get('messages'):
-                                last_msg = result_events[-1]['messages'][-1]
+                            result_after_approval = graph.invoke(None, config=config)
+                            if result_after_approval and result_after_approval.get('messages'):
+                                last_msg = result_after_approval['messages'][-1]
                                 if hasattr(last_msg, 'content') and last_msg.content:
                                     bot_name = getattr(last_msg, 'name', 'Bot')
                                     print(f"\n🤖 {bot_name.title()}: {last_msg.content}")
@@ -910,8 +993,8 @@ if __name__ == "__main__":
                             print("⚠️  Invalid input. Please type 'approve' or 'reject'.")
                 else:
                     # Normal completion - show the response
-                    if events and events[-1].get('messages'):
-                        last_msg = events[-1]['messages'][-1]
+                    if result and result.get('messages'):
+                        last_msg = result['messages'][-1]
                         bot_name = getattr(last_msg, 'name', None)
                         if bot_name == "general":
                             bot_label = "General Bot"
