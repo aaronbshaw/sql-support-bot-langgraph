@@ -15,7 +15,7 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, RemoveMessage
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities.sql_database import SQLDatabase
 from sqlalchemy import create_engine
@@ -294,9 +294,10 @@ When tools have been called and you receive tool responses, you must:
 CRITICAL: If you see "Tool results summary" in your context, you already have tool results and should respond directly to the user. Do NOT route to specialists again.
 
 Routing rules:
-- Base your routing decision on the latest user message. Only if the latest message is ambiguous, ask a follow-up question. Do not consider older messages for routing.
-- Emit EXACTLY ONE call to the Router tool (choose one of: music OR customer). Never call both.
-- Do not route if you can answer directly from history.
+- ALWAYS base your routing decision on the MOST RECENT user message, even if previous conversation was about a different topic
+- Users can switch topics at any time - respect the topic in their latest message
+- Emit EXACTLY ONE call to the Router tool (choose one of: music OR customer). Never call both
+- Only respond directly (without routing) if the latest message is a simple clarification about what was JUST discussed
 
 When routing to a specialist, include the user's exact request in your assistant message content so the specialist knows what to help with. Format: "User request: [exact user message]"""
 
@@ -328,6 +329,39 @@ def _get_last_ai_message(messages):
 
 def _is_tool_call(msg):
     return hasattr(msg, "additional_kwargs") and 'tool_calls' in msg.additional_kwargs
+
+def should_summarize(state):
+    """Determine if we should summarize the conversation.
+    
+    Returns 'summarize' if we have 10+ meaningful messages and no recent summary,
+    otherwise returns 'continue' to proceed with normal flow.
+    """
+    messages = state["messages"]
+    
+    # Get meaningful messages (human + AI responses, exclude tool messages and routing)
+    human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    ai_messages = [m for m in messages if isinstance(m, AIMessage)]
+    
+    # Filter out AI messages with tool calls (routing artifacts)
+    safe_ai_messages = []
+    for ai_msg in ai_messages:
+        if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
+            if not (hasattr(ai_msg, 'additional_kwargs') and 'tool_calls' in ai_msg.additional_kwargs):
+                safe_ai_messages.append(ai_msg)
+    
+    meaningful_messages = human_messages + safe_ai_messages
+    
+    # Check if we already have a summary
+    has_summary = any(
+        isinstance(m, SystemMessage) and hasattr(m, 'name') and m.name == "conversation_summary"
+        for m in messages
+    )
+    
+    # Summarize if we have 10+ meaningful messages and no existing summary
+    if len(meaningful_messages) > 10 and not has_summary:
+        return "summarize"
+    else:
+        return "continue"
 
 def _route(state):
     messages = state["messages"]
@@ -453,6 +487,76 @@ music_tools = [get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_
 customer_safe_tools = [get_customer_info]
 customer_sensitive_tools = [update_customer_info]   # This tool is only used for sensitive information like updating email or phone number
 
+def summarize_conversation(state):
+    """Summarize conversation when it gets too long (10+ meaningful messages).
+    
+    This node removes old messages and replaces them with a summary to save tokens.
+    Based on LangGraph tutorial: https://colab.research.google.com/drive/106khdPGF85ea5NlU9Xer-g7gTZ0eLD66
+    """
+    messages = state["messages"]
+    
+    # Get meaningful messages (human + AI responses, exclude tool messages and routing)
+    human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    ai_messages = [m for m in messages if isinstance(m, AIMessage)]
+    
+    # Filter out AI messages with tool calls (routing artifacts)
+    safe_ai_messages = []
+    for ai_msg in ai_messages:
+        if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
+            if not (hasattr(ai_msg, 'additional_kwargs') and 'tool_calls' in ai_msg.additional_kwargs):
+                safe_ai_messages.append(ai_msg)
+    
+    meaningful_messages = human_messages + safe_ai_messages
+    
+    # Keep the last 6 messages, summarize the rest
+    messages_to_keep = meaningful_messages[-6:]
+    messages_to_summarize = [m for m in meaningful_messages if m not in messages_to_keep]
+    
+    if not messages_to_summarize:
+        # Nothing to summarize
+        return {"messages": []}
+    
+    # Build summary text
+    summary_parts = []
+    for msg in messages_to_summarize:
+        if isinstance(msg, HumanMessage):
+            summary_parts.append(f"User: {msg.content[:150]}")
+        elif isinstance(msg, AIMessage):
+            content = msg.content[:150] if msg.content else "[no content]"
+            summary_parts.append(f"Bot: {content}")
+    
+    summary_text = "\n".join(summary_parts)
+    
+    summary_prompt = f"""You are summarizing a conversation between a user and a music store support bot.
+
+Summarize the key points from this conversation:
+- What topics were discussed (music, customer account, etc.)
+- Any important information provided (customer IDs, artist names, preferences)
+- Current status or outcomes
+
+Keep it concise (2-3 sentences max). Focus on facts that might be relevant for future turns.
+
+Conversation:
+{summary_text}
+
+Summary:"""
+    
+    # Get summary from model
+    summary_response = model.invoke([SystemMessage(content=summary_prompt)])
+    
+    # Create the summary message
+    summary_message = SystemMessage(
+        content=f"Previous conversation summary: {summary_response.content}",
+        name="conversation_summary"
+    )
+    
+    # Create RemoveMessage commands for old messages
+    delete_messages = [RemoveMessage(id=m.id) for m in messages_to_summarize]
+    
+    # Return: delete old messages + add summary
+    return {"messages": [summary_message] + delete_messages}
+
+# Tool nodes
 music_tools_node = ToolNode(music_tools)
 customer_safe_tools_node = ToolNode(customer_safe_tools)
 customer_sensitive_tools_node = ToolNode(customer_sensitive_tools)
@@ -473,73 +577,38 @@ def general_node(state):
         if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
             safe_ai_messages.append(ai_msg)
     
-    # Check if we need to summarize (conversation getting long)
-    # Count meaningful messages (human + safe AI, not tool messages or routing)
-    meaningful_messages = human_messages + safe_ai_messages
-    
     # Build context
     conversation_context = [SystemMessage(content=system_message)]
     
-    # Check if we have an existing conversation summary
+    # Check if we have an existing conversation summary (created by summarize_conversation node)
     existing_summary = None
     for msg in messages:
         if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
             existing_summary = msg
             break
     
-    if len(meaningful_messages) > 10:
-        # Long conversation - use summarization
-        if existing_summary:
-            # Use existing summary
-            conversation_context.append(existing_summary)
-        else:
-            # Create a new summary of older messages
-            # Keep last 4 messages, summarize the rest
-            messages_to_summarize = meaningful_messages[:-4]
-            
-            # Build summary prompt
-            summary_parts = []
-            for msg in messages_to_summarize:
-                if isinstance(msg, HumanMessage):
-                    summary_parts.append(f"User: {msg.content[:200]}")
-                elif isinstance(msg, AIMessage):
-                    summary_parts.append(f"Bot: {msg.content[:200]}")
-            
-            summary_text = "\n".join(summary_parts[-8:])  # Last 8 older messages to summarize
-            
-            summary_prompt = f"""Summarize this conversation between a user and a music store support bot. 
-Focus on: what the user asked about, any important IDs/info provided, and outcomes.
-Keep it concise (2-3 sentences max).
-
-Recent conversation:
-{summary_text}
-
-Summary:"""
-            
-            # Get summary from model
-            summary_response = model.invoke([SystemMessage(content=summary_prompt)])
-            summary_message = SystemMessage(
-                content=f"Previous conversation summary: {summary_response.content}",
-                name="conversation_summary"
-            )
-            conversation_context.append(summary_message)
-        
-        # Add recent messages (last 4)
-        recent_messages = meaningful_messages[-4:]
-        for msg in recent_messages:
-            conversation_context.append(msg)
-    else:
-        # Short conversation - use original approach
-        # Include recent conversation history for better context awareness
-        recent_humans = human_messages[-3:] if len(human_messages) > 3 else human_messages
-        for hm in recent_humans:
-            conversation_context.append(hm)
-        
-        recent_safe_ai = safe_ai_messages[-5:] if len(safe_ai_messages) > 5 else safe_ai_messages
-        for am in recent_safe_ai:
-            conversation_context.append(am)
+    # If there's a summary, include it for background context
+    if existing_summary:
+        conversation_context.append(existing_summary)
     
-    # Summarize recent tool outputs for safe inclusion (always include these)
+    # Include conversation history (summarize node already trimmed if needed)
+    # Add all except the LAST human message (we'll add that specially)
+    for hm in human_messages[:-1]:
+        conversation_context.append(hm)
+    
+    for am in safe_ai_messages:
+        conversation_context.append(am)
+    
+    # Add CURRENT user request with emphasis if we have a summary
+    # This ensures routing is based on the latest request, not the summary
+    if human_messages:
+        if existing_summary:
+            conversation_context.append(
+                SystemMessage(content=f"⚠️ CURRENT USER REQUEST (base your routing on THIS message, not the summary above):")
+            )
+        conversation_context.append(human_messages[-1])
+    
+    # Summarize recent tool outputs for safe inclusion
     if tool_messages:
         recent_tools = tool_messages[-5:] if len(tool_messages) > 5 else tool_messages
         # Create a compact summary string of tool outputs
@@ -555,17 +624,7 @@ Summary:"""
         conversation_context.append(SystemMessage(content=f"Tool results summary (most recent first):\n{tools_summary_text}"))
     
     result = general_chain.invoke(conversation_context)
-    
-    # If we just created a summary, store it in state for reuse
-    response_messages = [add_name(result, name="general")]
-    if len(meaningful_messages) > 10 and not existing_summary:
-        # Add the summary to state so we don't regenerate it
-        for msg in conversation_context:
-            if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
-                response_messages.insert(0, msg)
-                break
-    
-    return {"messages": response_messages}
+    return {"messages": [add_name(result, name="general")]}
 
 def music_node(state):
     messages = state["messages"]
@@ -686,6 +745,7 @@ def create_graph():
     workflow = StateGraph(State)
     
     # Add nodes
+    workflow.add_node("summarize_conversation", summarize_conversation)
     workflow.add_node("general", general_node)
     workflow.add_node("music", music_node)
     workflow.add_node("customer", customer_node)
@@ -694,7 +754,20 @@ def create_graph():
     workflow.add_node("customer_sensitive_tools", customer_sensitive_tools_node)
     
     # Add edges with proper routing restrictions
-    workflow.add_edge(START, "general") #always start with general
+    # Start with conditional: check if we need to summarize first
+    workflow.add_conditional_edges(
+        START,
+        should_summarize,
+        {
+            "summarize": "summarize_conversation",
+            "continue": "general"
+        }
+    )
+    
+    # After summarization, go to general
+    workflow.add_edge("summarize_conversation", "general")
+    
+    # General routes to specialists or ends
     workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", END: END})
     
     # Specialist agents can route to their tools, back to themselves, to general, or END
@@ -712,9 +785,7 @@ def create_graph():
     workflow.add_conditional_edges("customer_sensitive_tools", _route, {"customer": "customer"})
     
     # Compile with checkpointer for thread-level persistence
-    # interrupt_before will pause execution BEFORE the customer_sensitive_tools node executes
-    # This provides human-in-the-loop approval for sensitive operations
-    return workflow.compile(checkpointer=memory, interrupt_before=["customer_sensitive_tools"])
+    return workflow.compile(checkpointer=memory)
 
 # Create the graph instance
 graph = create_graph()
@@ -933,83 +1004,26 @@ if __name__ == "__main__":
                 graph_input = {"messages": [HumanMessage(content=user_input)]}
                 config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 20}
                 
-                # Use invoke() instead of stream() for interrupt to work properly
-                # invoke() will execute until an interrupt point and pause
                 result = graph.invoke(graph_input, config=config)
                 
-                # Check if execution was interrupted (waiting for approval)
-                snapshot = graph.get_state(config)
-                if snapshot.next:
-                    # Graph is interrupted - waiting for human approval
-                    print("\n" + "="*20)
-                    print("⚠️  HUMAN APPROVAL REQUIRED ⚠️")
-                    print("="*20)
-                    print(f"\nNext node to execute: {snapshot.next}")
-                    
-                    # Show what operation is being requested from the checkpoint state
-                    if snapshot.values.get('messages'):
-                        messages = snapshot.values['messages']
-                        # Find the tool call that needs approval
-                        for msg in reversed(messages):
-                            if isinstance(msg, AIMessage) and _is_tool_call(msg):
-                                tool_calls = msg.additional_kwargs.get('tool_calls', [])
-                                if tool_calls:
-                                    import json
-                                    tool_call = tool_calls[0]
-                                    tool_name = tool_call['function']['name']
-                                    tool_args = json.loads(tool_call['function']['arguments'])
-                                    print(f"\n📋 Requested Operation:")
-                                    print(f"   Tool: {tool_name}")
-                                    print(f"   Arguments:")
-                                    for key, value in tool_args.items():
-                                        print(f"      {key}: {value}")
-                                break
-                    
-                    # Get approval from user
-                    while True:
-                        approval = input("\n👤 Type 'approve' to proceed or 'reject' to cancel: ").strip().lower()
-                        
-                        if approval == 'approve':
-                            print("\n✅ Operation approved. Executing...")
-                            # Continue execution - pass None to resume from checkpoint
-                            result_after_approval = graph.invoke(None, config=config)
-                            if result_after_approval and result_after_approval.get('messages'):
-                                last_msg = result_after_approval['messages'][-1]
-                                if hasattr(last_msg, 'content') and last_msg.content:
-                                    bot_name = getattr(last_msg, 'name', 'Bot')
-                                    print(f"\n🤖 {bot_name.title()}: {last_msg.content}")
-                            break
-                        elif approval == 'reject':
-                            print("\n❌ Operation rejected. Cancelling...")
-                            # Update state to add rejection message and set next to None to end
-                            graph.update_state(
-                                config, 
-                                {"messages": [AIMessage(content="The update operation was rejected by the administrator.", name="customer")]},
-                                as_node="customer"
-                            )
-                            print("\n🤖 Customer Bot: The update operation was rejected by the administrator.")
-                            break
-                        else:
-                            print("⚠️  Invalid input. Please type 'approve' or 'reject'.")
-                else:
-                    # Normal completion - show the response
-                    if result and result.get('messages'):
-                        last_msg = result['messages'][-1]
-                        bot_name = getattr(last_msg, 'name', None)
-                        if bot_name == "general":
-                            bot_label = "General Bot"
-                        elif bot_name == "music":
-                            bot_label = "Music Bot"
-                        elif bot_name == "customer":
-                            bot_label = "Customer Bot"
-                        else:
-                            bot_label = "Bot"
-                        if hasattr(last_msg, 'content') and last_msg.content:
-                            print(f"\n🤖 {bot_label}: {last_msg.content}")
-                        else:
-                            print(f"\n🤖 {bot_label}: [Processing your request...]")
+                # Show the bot's response
+                if result and result.get('messages'):
+                    last_msg = result['messages'][-1]
+                    bot_name = getattr(last_msg, 'name', None)
+                    if bot_name == "general":
+                        bot_label = "General Bot"
+                    elif bot_name == "music":
+                        bot_label = "Music Bot"
+                    elif bot_name == "customer":
+                        bot_label = "Customer Bot"
                     else:
-                        print("\n🤖 Bot: I'm not sure how to help with that. Try asking about music or your account!")
+                        bot_label = "Bot"
+                    if hasattr(last_msg, 'content') and last_msg.content:
+                        print(f"\n🤖 {bot_label}: {last_msg.content}")
+                    else:
+                        print(f"\n🤖 {bot_label}: [Processing your request...]")
+                else:
+                    print("\n🤖 Bot: I'm not sure how to help with that. Try asking about music or your account!")
                     
             except KeyboardInterrupt:
                 print("\n\n👋 Goodbye! Thanks for using SQL Support Bot!")
