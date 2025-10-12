@@ -333,12 +333,15 @@ def _is_tool_call(msg):
 def should_summarize(state):
     """Determine if we should summarize the conversation.
     
-    Returns 'summarize' if we have 10+ meaningful messages and no recent summary,
+    Returns 'summarize' if we have 6+ meaningful messages (excluding summary itself),
     otherwise returns 'continue' to proceed with normal flow.
+    
+    This implements PROGRESSIVE summarization - the summary is continuously updated
+    as new messages arrive, not just created once.
     """
     messages = state["messages"]
     
-    # Get meaningful messages (human + AI responses, exclude tool messages and routing)
+    # Get meaningful messages (human + AI responses, exclude tool messages, routing, and summaries)
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
     ai_messages = [m for m in messages if isinstance(m, AIMessage)]
     
@@ -351,14 +354,9 @@ def should_summarize(state):
     
     meaningful_messages = human_messages + safe_ai_messages
     
-    # Check if we already have a summary
-    has_summary = any(
-        isinstance(m, SystemMessage) and hasattr(m, 'name') and m.name == "conversation_summary"
-        for m in messages
-    )
-    
-    # Summarize if we have 10+ meaningful messages and no existing summary
-    if len(meaningful_messages) > 10 and not has_summary:
+    # Summarize whenever we have more than 6 meaningful messages
+    # This creates a rolling/progressive summary that updates continuously
+    if len(meaningful_messages) > 6:
         return "summarize"
     else:
         return "continue"
@@ -488,12 +486,20 @@ customer_safe_tools = [get_customer_info]
 customer_sensitive_tools = [update_customer_info]   # This tool is only used for sensitive information like updating email or phone number
 
 def summarize_conversation(state):
-    """Summarize conversation when it gets too long (10+ meaningful messages).
+    """Progressively summarize conversation to keep context manageable.
     
-    This node removes old messages and replaces them with a summary to save tokens.
+    This node removes old messages and replaces them with a rolling summary.
+    If a summary already exists, it EXTENDS it with new information.
     Based on LangGraph tutorial: https://colab.research.google.com/drive/106khdPGF85ea5NlU9Xer-g7gTZ0eLD66
     """
     messages = state["messages"]
+    
+    # Check if we have an existing summary
+    existing_summary = None
+    for msg in messages:
+        if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
+            existing_summary = msg
+            break
     
     # Get meaningful messages (human + AI responses, exclude tool messages and routing)
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
@@ -508,52 +514,88 @@ def summarize_conversation(state):
     
     meaningful_messages = human_messages + safe_ai_messages
     
-    # Keep the last 6 messages, summarize the rest
-    messages_to_keep = meaningful_messages[-6:]
+    # Keep the last 3 messages, summarize/extend with the rest
+    messages_to_keep = meaningful_messages[-3:]
     messages_to_summarize = [m for m in meaningful_messages if m not in messages_to_keep]
     
     if not messages_to_summarize:
         # Nothing to summarize
         return {"messages": []}
     
-    # Build summary text
+    # Build summary text for new messages
     summary_parts = []
     for msg in messages_to_summarize:
         if isinstance(msg, HumanMessage):
-            summary_parts.append(f"User: {msg.content[:150]}")
+            summary_parts.append(f"User: {msg.content[:200]}")
         elif isinstance(msg, AIMessage):
-            content = msg.content[:150] if msg.content else "[no content]"
+            content = msg.content[:200] if msg.content else "[no content]"
             summary_parts.append(f"Bot: {content}")
     
-    summary_text = "\n".join(summary_parts)
+    new_messages_text = "\n".join(summary_parts)
     
-    summary_prompt = f"""You are summarizing a conversation between a user and a music store support bot.
+    # Create or extend summary
+    if existing_summary:
+        # EXTEND existing summary with new messages
+        summary_prompt = f"""You are updating a conversation summary for a music store support bot.
 
-Summarize the key points from this conversation:
-- What topics were discussed (music, customer account, etc.)
-- Any important information provided (customer IDs, artist names, preferences)
+EXISTING SUMMARY:
+{existing_summary.content}
+
+NEW MESSAGES TO ADD TO SUMMARY:
+{new_messages_text}
+
+Create an UPDATED comprehensive summary that:
+- Combines information from the existing summary with the new messages
+- Maintains ALL important details (for example: customer IDs, names, songs, albums, playlists, artists discussed)
+- Keeps the summary current and factual
+- Does NOT lose any critical information from either the old summary or new messages
+
+Updated Summary:"""
+        
+        # Get updated summary
+        summary_response = model.invoke([SystemMessage(content=summary_prompt)])
+        
+        # We'll delete the old summary and add the new one
+        delete_messages = [RemoveMessage(id=existing_summary.id)] + [RemoveMessage(id=m.id) for m in messages_to_summarize]
+    else:
+        # CREATE first summary
+        summary_prompt = f"""You are summarizing a conversation between a user and a music store support bot.
+
+Create a comprehensive summary (4-6 sentences) covering:
+- ALL topics discussed (music queries, customer account questions, etc.)
+- ALL important information provided (customer IDs, email addresses, artist names, album requests)
+- Specific data retrieved (customer names, song lists, etc.)
+- Any pending actions or unresolved requests
 - Current status or outcomes
 
-Keep it concise (2-3 sentences max). Focus on facts that might be relevant for future turns.
+Include ALL factual details that might be needed for future turns. Do NOT omit customer IDs, information, songs, albums, playlists, artists, or other key data.
 
 Conversation:
-{summary_text}
+{new_messages_text}
 
-Summary:"""
+Comprehensive Summary:"""
+        
+        # Get summary from model
+        summary_response = model.invoke([SystemMessage(content=summary_prompt)])
+        
+        # Delete old messages
+        delete_messages = [RemoveMessage(id=m.id) for m in messages_to_summarize]
     
-    # Get summary from model
-    summary_response = model.invoke([SystemMessage(content=summary_prompt)])
-    
-    # Create the summary message
+    # Create the summary message with clear formatting
     summary_message = SystemMessage(
-        content=f"Previous conversation summary: {summary_response.content}",
+        content=f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONVERSATION HISTORY SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{summary_response.content}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+(This is a summary of previous conversation. Recent messages follow below.)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""",
         name="conversation_summary"
     )
     
-    # Create RemoveMessage commands for old messages
-    delete_messages = [RemoveMessage(id=m.id) for m in messages_to_summarize]
-    
-    # Return: delete old messages + add summary
+    # Return: new summary + delete old messages (and old summary if it existed)
     return {"messages": [summary_message] + delete_messages}
 
 # Tool nodes
@@ -577,8 +619,8 @@ def general_node(state):
         if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
             safe_ai_messages.append(ai_msg)
     
-    # Build context
-    conversation_context = [SystemMessage(content=system_message)]
+    # Build context (don't add system_message here - the chain will add it)
+    conversation_context = []
     
     # Check if we have an existing conversation summary (created by summarize_conversation node)
     existing_summary = None
@@ -632,8 +674,8 @@ def music_node(state):
     # Extract message types
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
     
-    # Build context with conversation history
-    conversation_context = [SystemMessage(content=song_system_message)]
+    # Build context (don't add system message here - the chain will add it)
+    conversation_context = []
     
     # Only include the MOST RECENT human message (current request)
     # Including multiple human messages confuses the LLM about which request to answer
@@ -678,8 +720,8 @@ def customer_node(state):
         if not (hasattr(ai_msg, 'tool_calls') and ai_msg.tool_calls):
             safe_ai_messages.append(ai_msg)
     
-    # Build context: recent human messages + safe AI context
-    conversation_context = [SystemMessage(content=customer_prompt)]
+    # Build context (don't add system message here - the chain will add it)
+    conversation_context = []
     
     # Include recent human messages (increased to 5 for better memory)
     # This helps maintain context like customer IDs across multiple turns
