@@ -35,7 +35,11 @@ api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise ValueError("OPENAI_API_KEY environment variable is required")
 
-model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4o", api_key=api_key)
+# Create different models for different agents with tuned parameters
+supervisor_model = ChatOpenAI(temperature=0, top_p=1.0, streaming=True, model="gpt-4o", api_key=api_key)  # Deterministic routing could try gpt-4.1-mini
+music_model = ChatOpenAI(temperature=0.7, top_p=0.9, streaming=True, model="gpt-4o", api_key=api_key)  # Creative recommendations
+customer_model = ChatOpenAI(temperature=0.3, top_p=0.8, streaming=True, model="gpt-4o", api_key=api_key)  # Balanced - accurate but friendly
+model = supervisor_model  # For summarization (backward compatibility) 
 
 # Database setup
 def get_engine_for_chinook_db():
@@ -56,12 +60,14 @@ def get_engine_for_chinook_db():
 engine = get_engine_for_chinook_db()
 db = SQLDatabase(engine)
 
+
 # Define the memory (short-term memory with thread-level persistence)
 memory = MemorySaver()
 
 # Define the state schema for StateGraph
 class State(TypedDict):
     messages: Annotated[list, add_messages]
+
 
 # Tools
 @tool
@@ -73,7 +79,7 @@ def get_customer_info(identifier: str):
         
     Examples:
         - get_customer_info("1") - Look up by customer ID
-        - get_customer_info("john.doe@email.com") - Look up by email
+        - get_customer_info("example@email.com") - Look up by email (but never use example@email.com as an email address, it is just an example)
     """
     try:
         # Check if identifier is a number (customer ID)
@@ -215,10 +221,13 @@ def get_songs_in_playlist(playlist_name: str):
         include_columns=True
     )
 
-# Router model
+
+
+# Router model - Pydantic BaseModel that acts as a structured output tool for the supervisor agent to route the user to the appropriate representative. this is bound as a tool to the supervisor agent.
 class Router(BaseModel):
     """Call this if you are able to route the user to the appropriate representative."""
     choice: str = Field(description="should be one of: music, customer")
+
 
 # Prompts
 customer_prompt = """Your job is to help a user with their account information.
@@ -228,13 +237,11 @@ IMPORTANT: Always review the conversation history AND conversation summary (if p
 **CRITICAL: Check the conversation summary for customer ID or email address BEFORE asking the user for it again.**
 - If the summary contains "Customer ID: [number]" or "ID: [number]", use that ID
 - If the summary contains an email address, use that email
-- Only ask for ID/email if it's NOT in the summary or previous messages
+- Only ask for ID/email if it's NOT in the summary or previous messages.  Do not use any data in this system prompt as customer data.
 
 You have access to two customer tools:
 
-1. get_customer_info - Look up customer information by:
-   - Customer ID (a positive number like "1", "5", "10")
-   - Email address (exact match like "john.doe@email.com")
+1. get_customer_info - Look up customer information by customer ID (a positive integer) or email address, both require an exact match.
 
 2. update_customer_info - Update customer information fields:
    - Valid fields: FirstName, LastName, Company, Address, City, State, Country, PostalCode, Phone, Fax, Email
@@ -246,20 +253,20 @@ IMPORTANT GUIDELINES:
 2. Only ask for customer ID/email if not already provided in summary or context
 3. If the user doesn't know their customer ID, ask for their email address instead
 4. Before updating, verify the customer ID and confirm what field they want to update
-5. After updating, show the user their updated information (do NOT call update again)
-6. If there's an error or no customer found, explain the issue clearly
-7. Email addresses must be exact matches - partial matches will not work
+5. Before calling update_customer_info, verify the old and new values to the customer for and get confirmation, only after confirmation should you call update_customer_info
+6. After updating, show the user their updated information (do NOT call update again)
+7. If there's an error or no customer found, explain the issue clearly
+8. Email addresses must be exact matches - partial matches will not work
 
 If you are unable to help the user, politely explain what information you need and suggest they contact support if needed."""
 
-song_system_message = """Your job is to help a customer find information about music they are looking for. 
+music_prompt = """Your job is to help a customer find information about music they are looking for. 
 
 IMPORTANT: Always review the conversation history to understand what the customer has asked about previously. You can reference previous artists, songs, or topics they mentioned.
 
 You only have certain tools you can use. If a customer asks you to look something up that you don't know how, politely tell them what you can help with.
 
-When looking up artists and songs, sometimes the artist/song will not be found. In that case, the tools will return information \
-on simliar songs and artists. This is intentional, it is not the tool messing up."""
+When looking up artists and songs, sometimes the artist/song will not be found. In that case, the response will be empty or null or "", in this case stop searching and tell the user that you can't find it and tell them a joke about music."""
 
 system_message = """Your job is to help as a customer service representative for a music store.
 
@@ -269,6 +276,7 @@ You have TWO options for each customer request:
 2. **ROUTE TO SPECIALIST** if you need specialist help related to music or their account.
 
 ## When to RESPOND DIRECTLY:
+- Customer is having a conversation with you, not asking for music or account information - DO NOT respond with RESPOND DIRECTLY, respond in natural language.
 - Customer asks about previous topics mentioned in conversation
 - Customer asks for reminders or clarifications about what was discussed
 - Customer asks follow-up questions you can answer from context
@@ -311,15 +319,15 @@ When routing to a specialist, include the user's exact request in your assistant
 def get_customer_messages(messages):
     return [SystemMessage(content=customer_prompt)] + messages
 
-def get_song_messages(messages):
-    return [SystemMessage(content=song_system_message)] + messages
+def get_music_messages(messages):
+    return [SystemMessage(content=music_prompt)] + messages
 
-def get_messages(messages):
+def get_supervisor_messages(messages):
     return [SystemMessage(content=system_message)] + messages
 
-customer_chain = get_customer_messages | model.bind_tools([get_customer_info, update_customer_info])
-song_recc_chain = get_song_messages | model.bind_tools([get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_songs_in_playlist])
-general_chain = get_messages | model.bind_tools([Router])
+customer_chain = get_customer_messages | customer_model.bind_tools([get_customer_info, update_customer_info])
+music_recc_chain = get_music_messages | music_model.bind_tools([get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_songs_in_playlist])
+supervisor_chain = get_supervisor_messages | supervisor_model.bind_tools([Router])
 
 # Helper functions
 def add_name(message, name):
@@ -368,18 +376,18 @@ def should_summarize(state):
 def _route(state):
     messages = state["messages"]
     if not messages:
-        return "general"
+        return "supervisor"
     
     last_message = messages[-1]
     
-    # If last message is a human message, route to general
+    # If last message is a human message, route to supervisor
     if isinstance(last_message, HumanMessage):
-        return "general"
+        return "supervisor"
     
     # If last message is an AI message with tool calls
     if isinstance(last_message, AIMessage) and _is_tool_call(last_message):
-        if last_message.name == "general":
-            # General agent made a routing decision
+        if last_message.name == "supervisor":
+            # Supervisor agent made a routing decision
             # Check if we just came from a specialist agent WITHOUT new user input
             # If so, don't route to specialists again - END instead to avoid loops
             if len(messages) >= 2:
@@ -431,7 +439,7 @@ def _route(state):
             return "customer_safe_tools"  # Default to safe tools
         else:
             # Unknown agent with tool calls
-            return "general"
+            return "supervisor"
     
     # If last message is a tool response, route back to the agent that called it
     if isinstance(last_message, ToolMessage):
@@ -445,13 +453,13 @@ def _route(state):
                 elif agent_name == "customer":
                     return "customer"
                 break
-        # Default to general if we can't determine the calling agent
-        return "general"
+        # Default to supervisor if we can't determine the calling agent
+        return "supervisor"
     
     # If last message is an AI message without tool calls, decide routing based on agent
     if isinstance(last_message, AIMessage) and not _is_tool_call(last_message):
-        if last_message.name == "general":
-            return END  # General can end the turn
+        if last_message.name == "supervisor":
+            return END  # Supervisor can end the turn
         elif last_message.name in ["music", "customer"]:
             # Specialist agents without tool calls have responded with text
             # This means they're either asking for more info or can't help
@@ -459,14 +467,14 @@ def _route(state):
             return END
     
     # Default fallback
-    return "general"
+    return "supervisor"
 
 def _filter_out_routes(messages):
     """Filter out routing messages but keep tool calls and responses."""
     ms = []
     for m in messages:
-        if _is_tool_call(m) and m.name == "general":
-            # Skip general agent routing messages
+        if _is_tool_call(m) and m.name == "supervisor":
+            # Skip supervisor agent routing messages
             continue
         ms.append(m)
     return ms
@@ -621,15 +629,10 @@ Earlier messages provide context but should NOT influence routing decisions.
     # Return: new summary + delete old messages (and old summary if it existed)
     return {"messages": [summary_message] + delete_messages}
 
-# Tool nodes
-music_tools_node = ToolNode(music_tools)
-customer_safe_tools_node = ToolNode(customer_safe_tools)
-customer_sensitive_tools_node = ToolNode(customer_sensitive_tools)
-
-def general_node(state):
+def supervisor_node(state):
     messages = state["messages"]
     
-    # For general agent, pass full conversation context for smart routing and responses
+    # For supervisor agent, pass full conversation context for smart routing and responses
     # Include all human messages and recent safe AI responses (no tool calls)
     # Do NOT include raw ToolMessage objects (they must follow tool_calls). Instead, summarize them.
     human_messages = [m for m in messages if isinstance(m, HumanMessage)]
@@ -674,7 +677,7 @@ def general_node(state):
     # Add clear instruction about which message to respond to
     if human_messages:
         conversation_context.append(
-            SystemMessage(content=f"⚠️ ROUTING INSTRUCTION: The LAST user message above is the CURRENT request. Route based on THAT message. Earlier messages are for context only.")
+            SystemMessage(content=f"⚠️ SUPERVISOR ROUTING: The LAST user message above is the CURRENT request. Route based on THAT message. Earlier messages are for context only.")
         )
     
     # Summarize recent tool outputs for safe inclusion
@@ -692,8 +695,8 @@ def general_node(state):
         tools_summary_text = "\n".join(tool_summaries)
         conversation_context.append(SystemMessage(content=f"Tool results summary (most recent first):\n{tools_summary_text}"))
     
-    result = general_chain.invoke(conversation_context)
-    return {"messages": [add_name(result, name="general")]}
+    result = supervisor_chain.invoke(conversation_context)
+    return {"messages": [add_name(result, name="supervisor")]}
 
 def music_node(state):
     messages = state["messages"]
@@ -745,10 +748,10 @@ def music_node(state):
     # Add clear instruction about current vs context messages
     if human_messages and len(human_messages) > 1:
         conversation_context.append(
-            SystemMessage(content=f"⚠️ INSTRUCTION: The LAST user message above is the CURRENT request to answer. Earlier messages provide context (for references like 'these artists').")
+            SystemMessage(content=f"⚠️ INSTRUCTION: The LAST user message above is the CURRENT request to answer. Earlier messages provide context (for references like 'these artists'). Only call tools for the last user message, do not call tools for earlier messages.")
         )
     
-    result = song_recc_chain.invoke(conversation_context)
+    result = music_recc_chain.invoke(conversation_context)
     return {"messages": [add_name(result, name="music")]}
 
 def customer_node(state):
@@ -779,18 +782,24 @@ def customer_node(state):
         conversation_context.append(existing_summary)
     
     # Include messages in CHRONOLOGICAL ORDER to preserve conversation flow
+    # Limit to last 10 human/AI messages to prevent confusion from old topic switches
+    recent_messages_for_context = []
     for msg in messages:
         # Skip summary (already added)
         if isinstance(msg, SystemMessage) and hasattr(msg, 'name') and msg.name == "conversation_summary":
             continue
         # Add human messages
         elif isinstance(msg, HumanMessage):
-            conversation_context.append(msg)
+            recent_messages_for_context.append(msg)
         # Add AI messages (exclude tool calls)
         elif isinstance(msg, AIMessage):
             if not (hasattr(msg, 'tool_calls') and msg.tool_calls):
                 if not (hasattr(msg, 'additional_kwargs') and 'tool_calls' in msg.additional_kwargs):
-                    conversation_context.append(msg)
+                    recent_messages_for_context.append(msg)
+    
+    # Keep only last 10 messages to avoid overwhelming with old context
+    for msg in recent_messages_for_context[-10:]:
+        conversation_context.append(msg)
     
     # Always include the most recent customer lookup for context
     # This ensures the agent remembers customer info even across multiple turns
@@ -832,17 +841,24 @@ def customer_node(state):
                 tool_name = getattr(tm, "name", "tool")
                 conversation_context.append(SystemMessage(content=f"Tool result from {tool_name}: {content}"))
     
-    # Check if we just executed update_customer_info to prevent loops
-    recent_update_tools = [
+    # Check if we just executed a customer tool to prevent loops
+    recent_customer_tools = [
         m for m in messages[-3:] 
-        if isinstance(m, ToolMessage) and getattr(m, 'name', '') == 'update_customer_info'
+        if isinstance(m, ToolMessage) and getattr(m, 'name', '') in ['get_customer_info', 'update_customer_info']
     ]
     
-    if recent_update_tools:
-        # We just executed an update - tell the LLM to format a response, not call update again
-        conversation_context.append(
-            SystemMessage(content=f"⚠️ IMPORTANT: An update was just completed. Format a friendly response for the user based on the tool result above. Do NOT call update_customer_info again - the update is already done.")
-        )
+    if recent_customer_tools:
+        tool_name = getattr(recent_customer_tools[-1], 'name', '')
+        if tool_name == 'update_customer_info':
+            # We just executed an update - tell the LLM to format a response, not call update again
+            conversation_context.append(
+                SystemMessage(content=f"⚠️ IMPORTANT: An update was just completed. Format a friendly response for the user based on the tool result above. Do NOT call update_customer_info again - the update is already done.")
+            )
+        elif tool_name == 'get_customer_info':
+            # We just fetched customer info - respond to user, don't fetch again
+            conversation_context.append(
+                SystemMessage(content=f"⚠️ IMPORTANT: Customer information was just retrieved. Use the tool result above to answer the user's question. Do NOT call get_customer_info again - you already have the data.")
+            )
     
     # Add clear instruction about current vs context messages
     if human_messages:
@@ -852,6 +868,11 @@ def customer_node(state):
     
     result = customer_chain.invoke(conversation_context)
     return {"messages": [add_name(result, name="customer")]}
+
+# Tool nodes - sepcialized node in LangGraph that is a pre-built component to handle the execution of tools requested by LLMs within an Agent's workflow
+music_tools_node = ToolNode(music_tools)
+customer_safe_tools_node = ToolNode(customer_safe_tools)
+customer_sensitive_tools_node = ToolNode(customer_sensitive_tools)
 
 # Graph definition
 def create_graph():
@@ -866,7 +887,7 @@ def create_graph():
     
     # Add nodes
     workflow.add_node("summarize_conversation", summarize_conversation)
-    workflow.add_node("general", general_node)
+    workflow.add_node("supervisor", supervisor_node)
     workflow.add_node("music", music_node)
     workflow.add_node("customer", customer_node)
     workflow.add_node("music_tools", music_tools_node)
@@ -880,22 +901,22 @@ def create_graph():
         should_summarize,
         {
             "summarize": "summarize_conversation",
-            "continue": "general"
+            "continue": "supervisor"
         }
     )
     
-    # After summarization, go to general
-    workflow.add_edge("summarize_conversation", "general")
+    # After summarization, go to supervisor
+    workflow.add_edge("summarize_conversation", "supervisor")
     
-    # General routes to specialists or ends
-    workflow.add_conditional_edges("general", _route, {"music": "music", "customer": "customer", END: END})
+    # Supervisor routes to specialists or ends
+    workflow.add_conditional_edges("supervisor", _route, {"music": "music", "customer": "customer", END: END})
     
-    # Specialist agents can route to their tools, back to themselves, to general, or END
-    workflow.add_conditional_edges("music", _route, {"music_tools": "music_tools", "general": "general", END: END})
+    # Specialist agents can route to their tools, back to themselves, to supervisor, or END
+    workflow.add_conditional_edges("music", _route, {"music_tools": "music_tools", "supervisor": "supervisor", END: END})
     workflow.add_conditional_edges("customer", _route, {
         "customer_safe_tools": "customer_safe_tools", 
         "customer_sensitive_tools": "customer_sensitive_tools",
-        "general": "general", 
+        "supervisor": "supervisor", 
         END: END
     })
     
@@ -915,6 +936,15 @@ def get_graph():
     """Return the compiled graph for LangGraph Platform."""
     return graph
 
+
+
+
+
+
+
+
+
+# DEBUGGING TESTS - NOT USED IN PRODUCTION
 if __name__ == "__main__":
     # Debug mode - set to True to run tests, False to interact with the bot
     DEBUG_MODE = False
@@ -1130,8 +1160,8 @@ if __name__ == "__main__":
                 if result and result.get('messages'):
                     last_msg = result['messages'][-1]
                     bot_name = getattr(last_msg, 'name', None)
-                    if bot_name == "general":
-                        bot_label = "General Bot"
+                    if bot_name == "supervisor":
+                        bot_label = "Supervisor Bot"
                     elif bot_name == "music":
                         bot_label = "Music Bot"
                     elif bot_name == "customer":
